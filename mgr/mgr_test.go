@@ -1,14 +1,16 @@
 package mgr
 
 import (
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 var test1 = `{
@@ -273,7 +275,7 @@ func Test_Watch(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(1 * time.Second)
 	var conf ManagerConfig
 	m, err := NewManager(conf)
 	if err != nil {
@@ -295,7 +297,7 @@ func Test_Watch(t *testing.T) {
 	if len(m.watchers) != 2 {
 		t.Errorf("watchers exp 2 but got %v", len(m.watchers))
 	}
-	time.Sleep(time.Second) //因为使用了异步add runners 有可能还没执行完。
+	time.Sleep(5 * time.Second) //因为使用了异步add runners 有可能还没执行完。
 	var runnerLength int
 	m.lock.Lock()
 	runnerLength = len(m.runners)
@@ -312,14 +314,18 @@ func Test_Watch(t *testing.T) {
 	}
 
 	if !tryTest(10, func() bool {
-		m.lock.Lock()
+		m.lock.RLock()
 		runnerLength = len(m.runners)
-		m.lock.Unlock()
+		m.lock.RUnlock()
 		return runnerLength == 3
 	}) {
 		t.Fatalf("runners exp 3 after add test3.conf but got %v", runnerLength)
 	}
-	if !tryTest(10, func() bool { return m.cleanQueues[realdir].cleanerCount == 2 }) {
+	if !tryTest(10, func() bool {
+		m.cleanLock.RLock()
+		defer m.cleanLock.RUnlock()
+		return m.cleanQueues[realdir].cleanerCount == 2
+	}) {
 		t.Fatalf("cleanerCount exp 2 after add test3.conf  but got %v", m.cleanQueues[realdir].cleanerCount)
 	}
 
@@ -422,7 +428,7 @@ func Test_Watch_LogDir(t *testing.T) {
 		t.Error(err)
 	}
 	defer os.RemoveAll("./tests2")
-	os.Setenv("DIR_NOT_EXIST_SLEEP_TIME", "10")
+	os.Setenv("DIR_NOT_EXIST_SLEEP_TIME", "8")
 	defer func() {
 		os.Setenv("DIR_NOT_EXIST_SLEEP_TIME", DIR_NOT_EXIST_SLEEP_TIME)
 	}()
@@ -458,17 +464,10 @@ func Test_Watch_LogDir(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	sleepTimeStr := os.Getenv("DIR_NOT_EXIST_SLEEP_TIME")
-	if sleepTimeStr == "" {
-		sleepTimeStr = "10"
-	}
-	sleepTime, _ := strconv.ParseInt(sleepTimeStr, 10, 0)
-	time.Sleep(time.Duration(sleepTime) * time.Second)
+	time.Sleep(10 * time.Second)
 	m.lock.Lock()
 	_, ok = m.runners[confPathAbs]
 	m.lock.Unlock()
-	if !ok {
-		t.Fatal("runner of \"./tests2/confs1/test5.conf\" exp  after add test5.conf but not", m.runners, confPathAbs, time.Now().Format(time.RFC3339Nano))
-	}
+	assert.Equal(t, true, ok, fmt.Sprintf("runner of %v exp but not exsit in runners %v", confPathAbs, m.runners))
 	m.Stop()
 }

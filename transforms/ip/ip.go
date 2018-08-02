@@ -3,77 +3,212 @@ package ip
 import (
 	"errors"
 	"fmt"
+	"strings"
 
-	"github.com/qiniu/logkit/sender"
 	"github.com/qiniu/logkit/transforms"
-	"github.com/qiniu/logkit/utils"
-	"github.com/wangtuanjie/ip17mon"
+	. "github.com/qiniu/logkit/utils/models"
 )
 
-//更全的免费数据可以在ipip.net下载
-type IpTransformer struct {
-	StageTime string `json:"stage"`
-	Key       string `json:"key"`
-	DataPath  string `json:"data_path"`
-	loc       *ip17mon.Locator
-	stats     utils.StatsInfo
+const Name = "IP"
+
+const (
+	Region       = "Region"
+	City         = "City"
+	Country      = "Country"
+	Isp          = "Isp"
+	CountryCode  = "CountryCode"
+	Latitude     = "Latitude"
+	Longitude    = "Longitude"
+	DistrictCode = "DistrictCode"
+)
+
+var (
+	_ transforms.StatsTransformer = &Transformer{}
+	_ transforms.Transformer      = &Transformer{}
+	_ transforms.Initializer      = &Transformer{}
+)
+
+type Transformer struct {
+	StageTime   string `json:"stage"`
+	Key         string `json:"key"`
+	DataPath    string `json:"data_path"`
+	KeyAsPrefix bool   `json:"key_as_prefix"`
+	Language    string `json:"language"`
+
+	loc   Locator
+	stats StatsInfo
+
+	//为了提升性能提前做处理
+	keys             []string
+	lastEleKey       string
+	keysRegion       []string
+	keysCity         []string
+	keysCountry      []string
+	keysIsp          []string
+	keysCountryCode  []string
+	keysLatitude     []string
+	keysLongitude    []string
+	keysDistrictCode []string
 }
 
-func (it *IpTransformer) RawTransform(datas []string) ([]string, error) {
+func (t *Transformer) Init() error {
+	if t.Language == "" {
+		t.Language = "zh-CN"
+	}
+	loc, err := NewLocator(t.DataPath, t.Language)
+	if err != nil {
+		return err
+	}
+	t.loc = loc
+	t.keys = GetKeys(t.Key)
+
+	newKeys := make([]string, len(t.keys))
+	copy(newKeys, t.keys)
+	t.lastEleKey = t.keys[len(t.keys)-1]
+	t.keysRegion = generateKeys(t.keys, Region, t.KeyAsPrefix)
+	t.keysCity = generateKeys(t.keys, City, t.KeyAsPrefix)
+	t.keysCountry = generateKeys(t.keys, Country, t.KeyAsPrefix)
+	t.keysIsp = generateKeys(t.keys, Isp, t.KeyAsPrefix)
+	t.keysCountryCode = generateKeys(t.keys, CountryCode, t.KeyAsPrefix)
+	t.keysLatitude = generateKeys(t.keys, Latitude, t.KeyAsPrefix)
+	t.keysLongitude = generateKeys(t.keys, Longitude, t.KeyAsPrefix)
+	t.keysDistrictCode = generateKeys(t.keys, DistrictCode, t.KeyAsPrefix)
+	return nil
+}
+
+func generateKeys(keys []string, lastEle string, keyAsPrefix bool) []string {
+	newKeys := make([]string, len(keys))
+	copy(newKeys, keys)
+	if keyAsPrefix {
+		lastEle = keys[len(keys)-1] + "_" + lastEle
+	}
+	newKeys[len(keys)-1] = lastEle
+	return newKeys
+}
+
+func (_ *Transformer) RawTransform(datas []string) ([]string, error) {
 	return datas, errors.New("IP transformer not support rawTransform")
 }
 
-func (it *IpTransformer) Transform(datas []sender.Data) ([]sender.Data, error) {
-	var err, ferr error
-	if it.loc == nil {
-		it.loc, err = ip17mon.NewLocator(it.DataPath)
+func (t *Transformer) Transform(datas []Data) ([]Data, error) {
+	var err, fmtErr error
+	errNum := 0
+	if t.loc == nil {
+		err := t.Init()
 		if err != nil {
 			return datas, err
 		}
 	}
-	errnums := 0
+	newKeys := make([]string, len(t.keys))
 	for i := range datas {
-		val, ok := datas[i][it.Key]
+		copy(newKeys, t.keys)
+		val, getErr := GetMapValue(datas[i], t.keys...)
+		if getErr != nil {
+			errNum, err = transforms.SetError(errNum, getErr, transforms.GetErr, t.Key)
+			continue
+		}
+		strVal, ok := val.(string)
 		if !ok {
-			errnums++
-			err = fmt.Errorf("transform key %v not exist in data", it.Key)
+			notStringErr := fmt.Errorf("transform key %v data type is not string", t.Key)
+			errNum, err = transforms.SetError(errNum, notStringErr, transforms.General, "")
 			continue
 		}
-		strval, ok := val.(string)
-		if !ok {
-			errnums++
-			err = fmt.Errorf("transform key %v data type is not string", it.Key)
+		strVal = strings.TrimSpace(strVal)
+		info, findErr := t.loc.Find(strVal)
+		if findErr != nil {
+			errNum, err = transforms.SetError(errNum, findErr, transforms.General, "")
 			continue
 		}
-		info, nerr := it.loc.Find(strval)
-		if nerr != nil {
-			err = nerr
-			errnums++
-			continue
+		findErr = t.SetMapValue(datas[i], info.Region, t.keysRegion...)
+		if findErr != nil {
+			errNum, err = transforms.SetError(errNum, findErr, transforms.General, "")
 		}
-		datas[i]["Region"] = info.Region
-		datas[i]["City"] = info.City
-		datas[i]["Country"] = info.Country
-		datas[i]["Isp"] = info.Isp
+		findErr = t.SetMapValue(datas[i], info.City, t.keysCity...)
+		if findErr != nil {
+			errNum, err = transforms.SetError(errNum, findErr, transforms.General, "")
+		}
+		findErr = t.SetMapValue(datas[i], info.Country, t.keysCountry...)
+		if findErr != nil {
+			errNum, err = transforms.SetError(errNum, findErr, transforms.General, "")
+		}
+		findErr = t.SetMapValue(datas[i], info.Isp, t.keysIsp...)
+		if findErr != nil {
+			errNum, err = transforms.SetError(errNum, findErr, transforms.General, "")
+		}
+		if info.CountryCode != "" {
+			findErr = t.SetMapValue(datas[i], info.CountryCode, t.keysCountryCode...)
+			if findErr != nil {
+				errNum, err = transforms.SetError(errNum, findErr, transforms.General, "")
+			}
+		}
+		if info.Latitude != "" {
+			findErr = t.SetMapValue(datas[i], info.Latitude, t.keysLatitude...)
+			if findErr != nil {
+				errNum, err = transforms.SetError(errNum, findErr, transforms.General, "")
+			}
+		}
+		if info.Longitude != "" {
+			findErr = t.SetMapValue(datas[i], info.Longitude, t.keysLongitude...)
+			if findErr != nil {
+				errNum, err = transforms.SetError(errNum, findErr, transforms.General, "")
+			}
+		}
+		if info.DistrictCode != "" {
+			findErr = t.SetMapValue(datas[i], info.DistrictCode, t.keysDistrictCode...)
+			if findErr != nil {
+				errNum, err = transforms.SetError(errNum, findErr, transforms.General, "")
+			}
+		}
 	}
-	if err != nil {
-		it.stats.LastError = err.Error()
-		ferr = fmt.Errorf("find total %v erorrs in transform IP, last error info is %v", errnums, err)
-	}
-	it.stats.Errors += int64(errnums)
-	it.stats.Success += int64(len(datas) - errnums)
-	return datas, ferr
+
+	t.stats, fmtErr = transforms.SetStatsInfo(err, t.stats, int64(errNum), int64(len(datas)), t.Type())
+	return datas, fmtErr
 }
 
-func (it *IpTransformer) Description() string {
-	return "transform ip to country region and isp"
+//通过层级key设置value值, 如果keys不存在则不加前缀，否则加前缀
+func (t *Transformer) SetMapValue(m map[string]interface{}, val interface{}, keys ...string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	var curr map[string]interface{}
+	curr = m
+	for _, k := range keys[0 : len(keys)-1] {
+		finalVal, ok := curr[k]
+		if !ok {
+			n := make(map[string]interface{})
+			curr[k] = n
+			curr = n
+			continue
+		}
+		//判断val是否为map[string]interface{}类型
+		if curr, ok = finalVal.(map[string]interface{}); ok {
+			continue
+		}
+		if curr, ok = finalVal.(Data); ok {
+			continue
+		}
+		return fmt.Errorf("SetMapValueWithPrefix failed, %v is not the type of map[string]interface{}", keys)
+	}
+	//判断val(k)是否存在
+	_, exist := curr[keys[len(keys)-1]]
+	if exist {
+		curr[t.lastEleKey+"_"+keys[len(keys)-1]] = val
+	} else {
+		curr[keys[len(keys)-1]] = val
+	}
+	return nil
 }
 
-func (it *IpTransformer) Type() string {
+func (_ *Transformer) Description() string {
+	//return "transform ip to country region and isp"
+	return "获取IP的区域、国家、城市和运营商信息"
+}
+
+func (_ *Transformer) Type() string {
 	return "IP"
 }
 
-func (it *IpTransformer) SampleConfig() string {
+func (_ *Transformer) SampleConfig() string {
 	return `{
 		"type":"IP",
 		"stage":"after_parser",
@@ -82,34 +217,66 @@ func (it *IpTransformer) SampleConfig() string {
 	}`
 }
 
-func (it *IpTransformer) ConfigOptions() []utils.Option {
-	return []utils.Option{
-		transforms.KeyStageAfterOnly,
+func (_ *Transformer) ConfigOptions() []Option {
+	return []Option{
 		transforms.KeyFieldName,
 		{
 			KeyName:      "data_path",
 			ChooseOnly:   false,
-			Default:      "your/path/to/ip.dat",
+			Default:      "",
+			Required:     true,
+			Placeholder:  "your/path/to/ip.dat(x)",
 			DefaultNoUse: true,
 			Description:  "IP数据库路径(data_path)",
+			Type:         transforms.TransformTypeString,
+		},
+		{
+			KeyName:       "key_as_prefix",
+			ChooseOnly:    true,
+			ChooseOptions: []interface{}{false, true},
+			Required:      false,
+			Default:       true,
+			DefaultNoUse:  false,
+			Element:       Checkbox,
+			Description:   "字段名称作为前缀(key_as_prefix)",
+			Type:          transforms.TransformTypeString,
+		},
+		{
+			KeyName:      "language",
+			ChooseOnly:   false,
+			Default:      "zh-CN",
+			Required:     true,
+			Placeholder:  "zh-CN",
+			DefaultNoUse: true,
+			Description:  "mmdb格式库使用的语种",
+			Advance:      true,
 			Type:         transforms.TransformTypeString,
 		},
 	}
 }
 
-func (it *IpTransformer) Stage() string {
-	if it.StageTime == "" {
-		return transforms.StageAfterParser
-	}
-	return it.StageTime
+func (t *Transformer) Stage() string {
+	return transforms.StageAfterParser
 }
 
-func (it *IpTransformer) Stats() utils.StatsInfo {
-	return it.stats
+func (t *Transformer) Stats() StatsInfo {
+	return t.stats
+}
+
+func (t *Transformer) SetStats(err string) StatsInfo {
+	t.stats.LastError = err
+	return t.stats
+}
+
+func (t *Transformer) Close() error {
+	if t.loc != nil {
+		return t.loc.Close()
+	}
+	return nil
 }
 
 func init() {
-	transforms.Add("IP", func() transforms.Transformer {
-		return &IpTransformer{}
+	transforms.Add(Name, func() transforms.Transformer {
+		return &Transformer{}
 	})
 }

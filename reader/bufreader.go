@@ -15,17 +15,19 @@ import (
 	"os"
 	"regexp"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unsafe"
 
-	"sync/atomic"
-
 	"github.com/axgle/mahonia"
+
 	"github.com/qiniu/log"
-	"github.com/qiniu/logkit/utils"
+
+	. "github.com/qiniu/logkit/utils/models"
 )
 
 const (
-	defaultBufSize           = 4096
+	DefaultBufSize           = 4096
 	MaxHeadPatternBufferSize = 20 * 1024 * 1024
 )
 
@@ -46,28 +48,41 @@ type LastSync struct {
 
 // BufReader implements buffering for an FileReader object.
 type BufReader struct {
-	stopped      int32
-	buf          []byte
-	lineCache    string
-	rd           FileReader // reader provided by the client
-	r, w         int        // buf read and write positions
-	err          error
-	lastByte     int
-	lastRuneSize int
-	lastSync     LastSync
+	stopped       int32
+	buf           []byte
+	mutiLineCache []string
+	rd            FileReader // reader provided by the client
+	r, w          int        // buf read and write positions
+	err           error
+	lastByte      int
+	lastRuneSize  int
+	lastSync      LastSync
 
 	mux     sync.Mutex
 	decoder mahonia.Decoder
 
-	meta            *Meta // 存放offset的元信息
+	Meta            *Meta // 存放offset的元信息
 	multiLineRegexp *regexp.Regexp
 
-	stats     utils.StatsInfo
+	stats     StatsInfo
 	statsLock sync.RWMutex
+
+	lastErrShowTime time.Time
+
+	// 这里的变量用于记录buffer中的数据从底层的哪个DataSource出来的，用于精准定位seqfile的DataSource
+	lastRdSource []SourceIndex
+	latestSource string
+}
+
+type SourceIndex struct {
+	Source string
+	Index  int
 }
 
 const minReadBufferSize = 16
-const maxConsecutiveEmptyReads = 100
+
+//最大连续读到空的尝试次数
+const maxConsecutiveEmptyReads = 10
 
 // NewReaderSize returns a new Reader whose buffer has at least the specified
 // size. If the argument FileReader is already a Reader with large enough
@@ -114,11 +129,11 @@ func NewReaderSize(rd FileReader, meta *Meta, size int) (*BufReader, error) {
 	r.stopped = 0
 	r.reset(make([]byte, size), rd)
 
-	r.meta = meta
-	if r.meta.GetEncodingWay() != "" {
-		r.decoder = mahonia.NewDecoder(r.meta.GetEncodingWay())
+	r.Meta = meta
+	if r.Meta.GetEncodingWay() != "" {
+		r.decoder = mahonia.NewDecoder(r.Meta.GetEncodingWay())
 		if r.decoder == nil {
-			log.Warnf("Encoding Way [%v] is not supported, will read as utf-8", r.meta.GetEncodingWay())
+			log.Warnf("Encoding Way [%v] is not supported, will read as utf-8", r.Meta.GetEncodingWay())
 		}
 	}
 	if meta.IsExist() && meta.IsValid() {
@@ -134,7 +149,9 @@ func NewReaderSize(rd FileReader, meta *Meta, size int) (*BufReader, error) {
 			}
 		}
 	}
-	r.lineCache = string(linesbytes)
+	if len(linesbytes) > 0 {
+		r.mutiLineCache = append(r.mutiLineCache, string(linesbytes))
+	}
 	return r, nil
 }
 
@@ -149,18 +166,43 @@ func (b *BufReader) SetMode(mode string, v interface{}) (err error) {
 
 func (b *BufReader) reset(buf []byte, r FileReader) {
 	*b = BufReader{
-		buf:          buf,
-		rd:           r,
-		lastByte:     -1,
-		lastRuneSize: -1,
-		lineCache:    "",
-		lastSync:     LastSync{},
-		mux:          sync.Mutex{},
-		statsLock:    sync.RWMutex{},
+		buf:           buf,
+		rd:            r,
+		lastByte:      -1,
+		lastRuneSize:  -1,
+		mutiLineCache: make([]string, 0, 16),
+		lastSync:      LastSync{},
+		mux:           sync.Mutex{},
+		statsLock:     sync.RWMutex{},
 	}
 }
 
 var errNegativeRead = errors.New("bufio: reader returned negative count from Read")
+
+//刷新lastRdByteIndex
+func (b *BufReader) updateLastRdSource() {
+	if len(b.lastRdSource) <= 0 {
+		return
+	}
+	for i := range b.lastRdSource {
+		b.lastRdSource[i].Index -= b.r
+	}
+	var idx int
+	for _, v := range b.lastRdSource {
+		if v.Index > 0 {
+			break
+		}
+		idx++
+	}
+	if idx >= len(b.lastRdSource) {
+		b.lastRdSource = []SourceIndex{}
+		return
+	}
+	if idx > 0 {
+		b.lastRdSource = b.lastRdSource[idx:]
+	}
+	return
+}
 
 // fill reads a new chunk into the buffer.
 func (b *BufReader) fill() {
@@ -168,11 +210,16 @@ func (b *BufReader) fill() {
 	if b.r > 0 {
 		copy(b.buf, b.buf[b.r:b.w])
 		b.w -= b.r
+		b.updateLastRdSource()
 		b.r = 0
 	}
 
 	if b.w >= len(b.buf) {
-		panic(fmt.Sprintf("Runner[%v] bufio: tried to fill full buffer", b.meta.RunnerName))
+		panic(fmt.Sprintf("Runner[%v] bufio: tried to fill full buffer", b.Meta.RunnerName))
+	}
+	//如果从没出现过，则表示新开始，记录一下
+	if b.latestSource == "" {
+		b.latestSource = b.rd.Source()
 	}
 
 	// Read new data: try a limited number of times.
@@ -181,6 +228,21 @@ func (b *BufReader) fill() {
 		if n < 0 {
 			panic(errNegativeRead)
 		}
+		if b.latestSource != b.rd.Source() {
+			//这个情况表示文件的数据源出现了变化，在buf中已经出现了2个数据源的数据，要定位是哪个位置的数据出现的分隔
+			if rc, ok := b.rd.(NewLineBytesRecorder); ok {
+				SIdx := rc.NewLineBytesIndex()
+				for _, v := range SIdx {
+					// 从 NewLineBytesIndex 函数中返回的index值就是本次读取的批次中上一个DataSource的数据量，加上b.w就是上个DataSource的整体数据
+					b.lastRdSource = append(b.lastRdSource, SourceIndex{
+						Source: v.Source,
+						Index:  b.w + v.Index,
+					})
+				}
+				b.latestSource = b.rd.Source()
+			}
+		}
+
 		b.w += n
 		if err != nil {
 			b.err = err
@@ -311,7 +373,7 @@ func (b *BufReader) ReadString(delim byte) (ret string, err error) {
 	bytes, err := b.readBytes(delim)
 	ret = *(*string)(unsafe.Pointer(&bytes))
 	//默认都是utf-8
-	if b.meta.GetEncodingWay() != "" && b.meta.GetEncodingWay() != "utf-8" && b.decoder != nil {
+	if b.Meta.GetEncodingWay() != "" && b.Meta.GetEncodingWay() != "utf-8" && b.decoder != nil {
 		ret = b.decoder.ConvertString(ret)
 	}
 	return
@@ -324,45 +386,85 @@ func (b *BufReader) ReadPattern() (string, error) {
 		line, err := b.ReadString('\n')
 		//读取到line的情况
 		if len(line) > 0 {
-			if len(b.lineCache) <= 0 {
-				b.lineCache = line
+			if len(b.mutiLineCache) <= 0 {
+				b.mutiLineCache = []string{line}
 				continue
 			}
 			//匹配行首，成功则返回之前的cache，否则加入到cache，返回空串
 			if b.multiLineRegexp.Match([]byte(line)) {
-				line, b.lineCache = b.lineCache, line
+				tmp := line
+				line = string(b.FormMutiLine())
+				b.mutiLineCache = make([]string, 0, 16)
+				b.mutiLineCache = append(b.mutiLineCache, tmp)
 				return line, err
 			}
-			b.lineCache += line
+			b.mutiLineCache = append(b.mutiLineCache, line)
 			maxTimes = 0
 		} else { //读取不到日志
 			if err != nil {
-				line = b.lineCache
-				b.lineCache = ""
+				line = string(b.FormMutiLine())
+				b.mutiLineCache = make([]string, 0, 16)
 				return line, err
 			}
 			maxTimes++
 			//对于又没有错误，也读取不到日志的情况，最多允许10次重试
 			if maxTimes > 10 {
-				log.Debugf("Runner[%v] %v read empty line 10 times return empty", b.meta.RunnerName, b.Name())
+				log.Debugf("Runner[%v] %v read empty line 10 times return empty", b.Meta.RunnerName, b.Name())
 				return "", nil
 			}
 		}
 		//对于读取到了Cache的情况，继续循环，直到超过最大限制
-		if len(b.lineCache) > MaxHeadPatternBufferSize {
-			line = b.lineCache
-			b.lineCache = ""
+		if b.calcMutiLineCache() > MaxHeadPatternBufferSize {
+			line = string(b.FormMutiLine())
+			b.mutiLineCache = make([]string, 0, 16)
 			return line, err
 		}
 	}
+}
+
+func (b *BufReader) FormMutiLine() []byte {
+	if len(b.mutiLineCache) <= 0 {
+		return make([]byte, 0)
+	}
+	n := 0
+	for i := 0; i < len(b.mutiLineCache); i++ {
+		n += len(b.mutiLineCache[i])
+	}
+
+	xb := make([]byte, n)
+	bp := copy(xb, b.mutiLineCache[0])
+	for _, s := range b.mutiLineCache[1:] {
+		bp += copy(xb[bp:], s)
+	}
+	return xb
+}
+
+func (b *BufReader) calcMutiLineCache() (ret int) {
+	for _, v := range b.mutiLineCache {
+		ret += len(v)
+	}
+	return
 }
 
 //ReadLine returns a string line as a normal Reader
 func (b *BufReader) ReadLine() (ret string, err error) {
 	if b.multiLineRegexp == nil {
 		ret, err = b.ReadString('\n')
+		if os.IsNotExist(err) {
+			if b.lastErrShowTime.Add(5 * time.Second).Before(time.Now()) {
+				log.Errorf("%v ReadLine err %v", b.Meta.RunnerName, err)
+				b.lastErrShowTime = time.Now()
+			}
+		}
 	} else {
 		ret, err = b.ReadPattern()
+	}
+	if skp, ok := b.rd.(LineSkipper); ok {
+		if skp.IsNewOpen() {
+			log.Infof("%v Skip line %v as first line skipper was configured %v", b.Meta.RunnerName, ret)
+			ret = ""
+			skp.SetSkipped()
+		}
 	}
 	if err != nil && err != io.EOF {
 		b.setStatsError(err.Error())
@@ -387,6 +489,12 @@ func (b *BufReader) Name() string {
 }
 
 func (b *BufReader) Source() string {
+	//如果我当前读取的位置在上个数据源index之前，则返回上个数据源
+	for _, v := range b.lastRdSource {
+		if (b.r < v.Index) || (v.Index > 0 && b.r == v.Index) {
+			return v.Source
+		}
+	}
 	return b.rd.Source()
 }
 
@@ -395,7 +503,7 @@ func (b *BufReader) Close() error {
 	return b.rd.Close()
 }
 
-func (b *BufReader) Status() utils.StatsInfo {
+func (b *BufReader) Status() StatsInfo {
 	b.statsLock.RLock()
 	defer b.statsLock.RUnlock()
 	return b.stats
@@ -407,34 +515,43 @@ func (b *BufReader) setStatsError(err string) {
 	b.stats.LastError = err
 }
 
+func (b *BufReader) Lag() (rl *LagInfo, err error) {
+	lr, ok := b.rd.(LagReader)
+	if ok {
+		return lr.Lag()
+	}
+
+	return rl, fmt.Errorf("internal reader haven't support lag info yet")
+}
+
 func (b *BufReader) SyncMeta() {
 	b.mux.Lock()
 	defer b.mux.Unlock()
-
+	linecache := string(b.FormMutiLine())
 	//把linecache也缓存
-	if b.lastSync.cache != b.lineCache || b.lastSync.buf != string(b.buf) || b.r != b.lastSync.r || b.w != b.lastSync.w {
-		log.Debugf("Runner[%v] %v sync meta started, linecache [%v] buf [%v] （%v %v）", b.meta.RunnerName, b.Name(), b.lineCache, string(b.buf), b.r, b.w)
-		err := b.meta.WriteBuf(b.buf, b.r, b.w, len(b.buf))
+	if b.lastSync.cache != linecache || b.lastSync.buf != string(b.buf) || b.r != b.lastSync.r || b.w != b.lastSync.w {
+		log.Debugf("Runner[%v] %v sync meta started, linecache [%v] buf [%v] （%v %v）", b.Meta.RunnerName, b.Name(), linecache, string(b.buf), b.r, b.w)
+		err := b.Meta.WriteBuf(b.buf, b.r, b.w, len(b.buf))
 		if err != nil {
-			log.Errorf("Runner[%v] %s cannot write buf, err :%v", b.meta.RunnerName, b.Name(), err)
+			log.Errorf("Runner[%v] %s cannot write buf, err :%v", b.Meta.RunnerName, b.Name(), err)
 			return
 		}
-		err = b.meta.WriteCacheLine(b.lineCache)
+		err = b.Meta.WriteCacheLine(linecache)
 		if err != nil {
-			log.Errorf("Runner[%v] %s cannot write linecache, err :%v", b.meta.RunnerName, b.Name(), err)
+			log.Errorf("Runner[%v] %s cannot write linecache, err :%v", b.Meta.RunnerName, b.Name(), err)
 			return
 		}
-		b.lastSync.cache = b.lineCache
+		b.lastSync.cache = linecache
 		b.lastSync.buf = string(b.buf)
 		b.lastSync.r = b.r
 		b.lastSync.w = b.w
-		log.Debugf("Runner[%v] %v sync meta succeed, linecache [%v] buf [%v] （%v %v）", b.meta.RunnerName, b.Name(), b.lineCache, string(b.buf), b.r, b.w)
+		log.Debugf("Runner[%v] %v sync meta succeed, linecache [%v] buf [%v] （%v %v）", b.Meta.RunnerName, b.Name(), linecache, string(b.buf), b.r, b.w)
 	} else {
-		log.Debugf("Runner[%v] %v meta data was just syncd, cache %v, buf %v, r,w =(%v,%v), ignore this sync...", b.meta.RunnerName, b.Name(), b.lineCache, string(b.buf), b.r, b.w)
+		log.Debugf("Runner[%v] %v meta data was just syncd, cache %v, buf %v, r,w =(%v,%v), ignore this sync...", b.Meta.RunnerName, b.Name(), linecache, string(b.buf), b.r, b.w)
 	}
 	err := b.rd.SyncMeta()
 	if err != nil {
-		log.Errorf("Runner[%v] %s cannot write reader %v's meta info, err %v", b.meta.RunnerName, b.Name(), b.rd.Name(), err)
+		log.Errorf("Runner[%v] %s cannot write reader %v's meta info, err %v", b.Meta.RunnerName, b.Name(), b.rd.Name(), err)
 		return
 	}
 }

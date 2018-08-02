@@ -2,11 +2,16 @@ package mutate
 
 import (
 	"fmt"
-	"strings"
+	"regexp"
 
-	"github.com/qiniu/logkit/sender"
 	"github.com/qiniu/logkit/transforms"
-	"github.com/qiniu/logkit/utils"
+	. "github.com/qiniu/logkit/utils/models"
+)
+
+var (
+	_ transforms.StatsTransformer = &Replacer{}
+	_ transforms.Transformer      = &Replacer{}
+	_ transforms.Initializer      = &Replacer{}
 )
 
 type Replacer struct {
@@ -14,46 +19,67 @@ type Replacer struct {
 	Key       string `json:"key"`
 	Old       string `json:"old"`
 	New       string `json:"new"`
-	stats     utils.StatsInfo
+	Regex     bool   `json:"regex"`
+	stats     StatsInfo
+	Regexp    *regexp.Regexp
+
+	keys []string
 }
 
-func (g *Replacer) Transform(datas []sender.Data) ([]sender.Data, error) {
-	var err, ferr error
-	errnums := 0
+func (g *Replacer) Init() error {
+	rgexpr := g.Old
+	if !g.Regex {
+		rgexpr = regexp.QuoteMeta(g.Old)
+	}
+	rgx, err := regexp.Compile(rgexpr)
+	if err != nil {
+		return err
+	}
+	g.Regexp = rgx
+	g.keys = GetKeys(g.Key)
+	return nil
+}
+
+func (g *Replacer) Transform(datas []Data) ([]Data, error) {
+	var err, fmtErr error
+	errNum := 0
+
 	for i := range datas {
-		val, ok := datas[i][g.Key]
-		if !ok {
-			errnums++
+		val, getErr := GetMapValue(datas[i], g.keys...)
+		if getErr != nil {
+			errNum++
 			err = fmt.Errorf("transform key %v not exist in data", g.Key)
 			continue
 		}
-		strval, ok := val.(string)
+		strVal, ok := val.(string)
 		if !ok {
-			errnums++
+			errNum++
 			err = fmt.Errorf("transform key %v data type is not string", g.Key)
 			continue
 		}
-		datas[i][g.Key] = strings.Replace(strval, g.Old, g.New, -1)
+		setErr := SetMapValue(datas[i], g.Regexp.ReplaceAllString(strVal, g.New), false, g.keys...)
+		if setErr != nil {
+			errNum++
+			err = fmt.Errorf("value of %v is not the type of map[string]interface{}", g.Key)
+		}
 	}
-	if err != nil {
-		g.stats.LastError = err.Error()
-		ferr = fmt.Errorf("find total %v erorrs in transform replace, last error info is %v", errnums, err)
-	}
-	g.stats.Errors += int64(errnums)
-	g.stats.Success += int64(len(datas) - errnums)
-	return datas, ferr
+
+	g.stats, fmtErr = transforms.SetStatsInfo(err, g.stats, int64(errNum), int64(len(datas)), g.Type())
+	return datas, fmtErr
 }
 
 func (g *Replacer) RawTransform(datas []string) ([]string, error) {
 	for i := range datas {
-		datas[i] = strings.Replace(datas[i], g.Old, g.New, -1)
+		datas[i] = g.Regexp.ReplaceAllString(datas[i], g.New)
 	}
-	g.stats.Success += int64(len(datas))
+
+	g.stats, _ = transforms.SetStatsInfo(nil, g.stats, 0, int64(len(datas)), g.Type())
 	return datas, nil
 }
 
 func (g *Replacer) Description() string {
-	return "replace old string to new"
+	//return "replace old string to new"
+	return "用新字符串替换旧字符串"
 }
 
 func (g *Replacer) Type() string {
@@ -66,18 +92,21 @@ func (g *Replacer) SampleConfig() string {
 		"stage":"before_parser",
 		"key":"MyReplaceFieldKey",
 		"old":"myOldString",
-		"new":"myNewString"
+		"new":"myNewString",
+        "regex":"false"
 	}`
 }
 
-func (g *Replacer) ConfigOptions() []utils.Option {
-	return []utils.Option{
+func (g *Replacer) ConfigOptions() []Option {
+	return []Option{
 		transforms.KeyStage,
 		transforms.KeyFieldName,
 		{
 			KeyName:      "old",
 			ChooseOnly:   false,
-			Default:      "myOldString",
+			Default:      "",
+			Required:     true,
+			Placeholder:  "myOldString",
 			DefaultNoUse: true,
 			Description:  "要替换的字符串内容(old)",
 			Type:         transforms.TransformTypeString,
@@ -85,10 +114,22 @@ func (g *Replacer) ConfigOptions() []utils.Option {
 		{
 			KeyName:      "new",
 			ChooseOnly:   false,
-			Default:      "myNewString",
+			Default:      "",
+			Required:     false,
+			Placeholder:  "myNewString",
 			DefaultNoUse: true,
 			Description:  "替换为的字符串内容(new)",
 			Type:         transforms.TransformTypeString,
+		},
+		{
+			KeyName:       "regex",
+			Element:       Radio,
+			ChooseOnly:    true,
+			ChooseOptions: []interface{}{false, true},
+			Default:       false,
+			DefaultNoUse:  false,
+			Description:   "是否启用正则匹配(regex)",
+			Type:          transforms.TransformTypeBoolean,
 		},
 	}
 }
@@ -100,7 +141,12 @@ func (g *Replacer) Stage() string {
 	return g.StageTime
 }
 
-func (g *Replacer) Stats() utils.StatsInfo {
+func (g *Replacer) Stats() StatsInfo {
+	return g.stats
+}
+
+func (g *Replacer) SetStats(err string) StatsInfo {
+	g.stats.LastError = err
 	return g.stats
 }
 

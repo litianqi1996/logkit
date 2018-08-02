@@ -3,7 +3,9 @@ package parser
 import (
 	"strconv"
 	"strings"
-	"time"
+
+	"github.com/qiniu/logkit/conf"
+	. "github.com/qiniu/logkit/utils/models"
 
 	"github.com/qiniu/log"
 )
@@ -31,17 +33,10 @@ func alignTime(t int64, base int64) int64 {
 	return (t / base) * base
 }
 
-type schemaErr struct {
-	number int
-	last   time.Time
-}
-
-func (s *schemaErr) Output(err error) {
-	s.number++
-	if time.Now().Sub(s.last) > 3*time.Second {
-		log.Errorf("%v parse line errors occured, same as %v", s.number, err)
-		s.number = 0
-		s.last = time.Now()
+func newLabel(name, dataValue string) Label {
+	return Label{
+		Name:  name,
+		Value: dataValue,
 	}
 }
 
@@ -61,6 +56,52 @@ func GetLabels(labelList []string, nameMap map[string]struct{}) (labels []Label)
 		nameMap[labelName] = struct{}{}
 		l := newLabel(labelName, labelValue)
 		labels = append(labels, l)
+	}
+	return
+}
+
+func ConvertWebParserConfig(conf conf.MapConf) conf.MapConf {
+	if conf == nil {
+		return conf
+	}
+
+	rawCustomPatterns, _ := conf.GetStringOr(KeyGrokCustomPatterns, "")
+	if rawCustomPatterns != "" {
+		realCustomPatterns, err := DecodeString(rawCustomPatterns)
+		if err != nil {
+			log.Errorf("decode %v error: %v", rawCustomPatterns, err)
+			return conf
+		}
+		conf[KeyGrokCustomPatterns] = string(realCustomPatterns)
+	}
+
+	splitter, _ := conf.GetStringOr(KeyCSVSplitter, "")
+	if splitter != "" {
+		splitter = strings.Replace(splitter, "\\t", "\t", -1)
+		conf[KeyCSVSplitter] = splitter
+	}
+
+	return conf
+}
+
+func ParseTimeZoneOffset(zoneoffset string) (ret int) {
+	zoneoffset = strings.TrimSpace(zoneoffset)
+	if zoneoffset == "" {
+		return
+	}
+	mi := false
+	if strings.HasPrefix(zoneoffset, "-") {
+		mi = true
+	}
+	zoneoffset = strings.Trim(zoneoffset, "+-")
+	i, err := strconv.ParseInt(zoneoffset, 10, 64)
+	if err != nil {
+		log.Errorf("parse %v error %v, ignore zoneoffset...", zoneoffset, err)
+		return
+	}
+	ret = int(i)
+	if mi {
+		ret = 0 - ret
 	}
 	return
 }

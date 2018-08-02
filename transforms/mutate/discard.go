@@ -1,35 +1,64 @@
 package mutate
 
 import (
-	"errors"
+	"strings"
 
-	"github.com/qiniu/logkit/sender"
 	"github.com/qiniu/logkit/transforms"
-	"github.com/qiniu/logkit/utils"
+	. "github.com/qiniu/logkit/utils/models"
+)
+
+var (
+	_ transforms.StatsTransformer = &Discarder{}
+	_ transforms.Transformer      = &Discarder{}
+	_ transforms.Initializer      = &Discarder{}
 )
 
 type Discarder struct {
-	Key   string `json:"key"`
-	stats utils.StatsInfo
+	Key       string `json:"key"`
+	StageTime string `json:"stage"`
+	stats     StatsInfo
+
+	discardKeys [][]string
+}
+
+func (g *Discarder) Init() error {
+	discardKeys := strings.Split(g.Key, ",")
+	g.discardKeys = make([][]string, len(discardKeys))
+	for i := range g.discardKeys {
+		g.discardKeys[i] = GetKeys(discardKeys[i])
+	}
+	return nil
 }
 
 func (g *Discarder) RawTransform(datas []string) ([]string, error) {
-	return datas, errors.New("discard transformer not support rawTransform")
+	var ret []string
+	for i := range datas {
+		if strings.Contains(datas[i], g.Key) {
+			continue
+		}
+		ret = append(ret, datas[i])
+	}
+
+	g.stats, _ = transforms.SetStatsInfo(nil, g.stats, 0, int64(len(datas)), g.Type())
+	return ret, nil
 }
 
-func (g *Discarder) Transform(datas []sender.Data) ([]sender.Data, error) {
-	var ferr error
-	errnums := 0
-	for i := range datas {
-		delete(datas[i], g.Key)
+func (g *Discarder) Transform(datas []Data) ([]Data, error) {
+	if g.discardKeys == nil {
+		g.Init()
 	}
-	g.stats.Errors += int64(errnums)
-	g.stats.Success += int64(len(datas) - errnums)
-	return datas, ferr
+	for _, keys := range g.discardKeys {
+		for i := range datas {
+			DeleteMapValue(datas[i], keys...)
+		}
+	}
+	g.stats, _ = transforms.SetStatsInfo(nil, g.stats, 0, int64(len(datas)), g.Type())
+	return datas, nil
 }
 
 func (g *Discarder) Description() string {
-	return "discard onefield from data"
+	//return "discard onefield from data"
+	return `删除指定的数据字段, 如数据{"a":123,"b":"xx"}, 指定删除a，变为{"b":"xx"}, 可写多个用逗号分隔 a,b 数据变为空 {}`
 }
 
 func (g *Discarder) Type() string {
@@ -39,22 +68,30 @@ func (g *Discarder) Type() string {
 func (g *Discarder) SampleConfig() string {
 	return `{
 		"type":"discard",
-		"key":"DiscardFieldKey"
+		"key":"DiscardFieldKey1,DiscardFieldKey2",
+		"stage":"after_parser"
 	}`
 }
 
-func (g *Discarder) ConfigOptions() []utils.Option {
-	return []utils.Option{
-		transforms.KeyStageAfterOnly,
+func (g *Discarder) ConfigOptions() []Option {
+	return []Option{
 		transforms.KeyFieldName,
 	}
 }
 
 func (g *Discarder) Stage() string {
-	return transforms.StageAfterParser
+	if g.StageTime == "" {
+		return transforms.StageAfterParser
+	}
+	return g.StageTime
 }
 
-func (g *Discarder) Stats() utils.StatsInfo {
+func (g *Discarder) Stats() StatsInfo {
+	return g.stats
+}
+
+func (g *Discarder) SetStats(err string) StatsInfo {
+	g.stats.LastError = err
 	return g.stats
 }
 

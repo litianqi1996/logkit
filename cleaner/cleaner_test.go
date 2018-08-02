@@ -33,7 +33,7 @@ func Test_CheckBelong(t *testing.T) {
 	defer os.RemoveAll(logfiles)
 	c := conf.MapConf{}
 	c[reader.KeyMetaPath] = logfiles
-	c[clean_enable] = "true"
+	c[KeyCleanEnable] = "true"
 	c[reader.KeyLogPath] = logfiles
 	c[reader.KeyMode] = "dir"
 	meta, err := reader.NewMetaWithConf(c)
@@ -120,9 +120,10 @@ func Test_clean(t *testing.T) {
 	c[reader.KeyMetaPath] = donefiles
 	c[reader.KeyLogPath] = donefiles + "/" + "log"
 	c[reader.KeyMode] = "dir"
-	c[clean_enable] = "true"
-	c[reservefileSize] = "15"
-	c[reservefileNumber] = "1"
+	c[KeyCleanEnable] = "true"
+	c[KeyReserveFileSize] = "15"
+	c[KeyReserveFileNumber] = "1"
+	c[KeyCleanInterval] = "1"
 	meta, err := reader.NewMetaWithConf(c)
 	if err != nil {
 		t.Error(err)
@@ -143,7 +144,7 @@ func Test_clean(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	time.Sleep(30 * time.Microsecond)
+	time.Sleep(3 * time.Second)
 	files, err := ioutil.ReadDir(donefiles)
 	if err != nil {
 		t.Error(err)
@@ -170,7 +171,7 @@ func Test_clean(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	time.Sleep(30 * time.Microsecond)
+	time.Sleep(3 * time.Second)
 	files, err = ioutil.ReadDir(donefiles)
 	if err != nil {
 		t.Error(err)
@@ -203,7 +204,7 @@ func Test_clean(t *testing.T) {
 	cl.reserveNumber = 10
 	cl.reserveSize = 10 * 1024 * 1024
 	err = cl.Clean()
-	time.Sleep(30 * time.Microsecond)
+	time.Sleep(3 * time.Second)
 	if err != nil {
 		t.Error(err)
 	}

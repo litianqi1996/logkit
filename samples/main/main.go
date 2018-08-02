@@ -1,17 +1,18 @@
 package main
 
 import (
+	_ "net/http/pprof"
 	"os"
 	"runtime"
 
 	config "github.com/qiniu/logkit/conf"
+	_ "github.com/qiniu/logkit/metric/all"
 	"github.com/qiniu/logkit/mgr"
 	"github.com/qiniu/logkit/parser"
+	"github.com/qiniu/logkit/reader"
 	"github.com/qiniu/logkit/samples"
 	"github.com/qiniu/logkit/sender"
-	"github.com/qiniu/logkit/utils"
-
-	_ "net/http/pprof"
+	utilsos "github.com/qiniu/logkit/utils/os"
 
 	"github.com/qiniu/log"
 )
@@ -26,7 +27,7 @@ type Config struct {
 var conf Config
 
 func main() {
-	config.Init("f", "qbox", "qboxlogexporter.conf")
+	config.Init("f", "", "main.conf")
 	if err := config.Load(&conf); err != nil {
 		log.Fatal("config.Load failed:", err)
 	}
@@ -38,14 +39,17 @@ func main() {
 	runtime.GOMAXPROCS(conf.MaxProcs)
 	log.SetOutputLevel(conf.DebugLevel)
 
-	pregistry := parser.NewParserRegistry()
+	rr := reader.NewRegistry()
+
+	pr := parser.NewRegistry()
 	// 注册你自定义的parser
-	pregistry.RegisterParser("myparser", samples.NewMyParser)
+	pr.RegisterParser("myparser", samples.NewMyParser)
 
-	sregistry := sender.NewSenderRegistry()
-	sregistry.RegisterSender("mysender", samples.NewMySender)
+	sr := sender.NewRegistry()
+	// 注册你自定义的parser
+	sr.RegisterSender("mysender", samples.NewMySender)
 
-	m, err := mgr.NewCustomManager(conf.ManagerConfig, pregistry, sregistry)
+	m, err := mgr.NewCustomManager(conf.ManagerConfig, rr, pr, sr)
 	if err != nil {
 		log.Fatalf("NewManager: %v", err)
 	}
@@ -64,5 +68,5 @@ func main() {
 	if err = m.Watch(paths); err != nil {
 		log.Fatalf("watch path error %v", err)
 	}
-	utils.WaitForInterrupt(func() { m.Stop() })
+	utilsos.WaitForInterrupt(func() { m.Stop() })
 }

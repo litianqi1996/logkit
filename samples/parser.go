@@ -5,7 +5,7 @@ import (
 
 	"github.com/qiniu/logkit/conf"
 	"github.com/qiniu/logkit/parser"
-	"github.com/qiniu/logkit/sender"
+	. "github.com/qiniu/logkit/utils/models"
 )
 
 // 一个自定义parser的示例，将日志放到data中的log字段中
@@ -16,7 +16,7 @@ type CustomParser struct {
 	maxLen int
 }
 
-func NewMyParser(c conf.MapConf) (parser.LogParser, error) {
+func NewMyParser(c conf.MapConf) (parser.Parser, error) {
 	// 获取parser配置中的name项，默认myparser
 	name, _ := c.GetStringOr("name", "myparsername")
 	// 获取parser配置中的max_len选项，默认1000
@@ -32,9 +32,9 @@ func (p *CustomParser) Name() string {
 	return p.name
 }
 
-func (p *CustomParser) Parse(lines []string) (datas []sender.Data, err error) {
+func (p *CustomParser) Parse(lines []string) (datas []Data, err error) {
 	for _, l := range lines {
-		d := sender.Data{}
+		d := Data{}
 		line := strings.TrimSpace(l)
 		if len(line) > p.maxLen {
 			line = line[:p.maxLen]

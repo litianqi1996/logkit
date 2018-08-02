@@ -1,27 +1,29 @@
 package reader
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io/ioutil"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/qiniu/logkit/conf"
-	"github.com/qiniu/logkit/utils"
+	"github.com/json-iterator/go"
 
 	"github.com/qiniu/log"
+
+	"github.com/qiniu/logkit/conf"
+	. "github.com/qiniu/logkit/utils/models"
+	utilsos "github.com/qiniu/logkit/utils/os"
 )
 
 const (
 	metaFileName      = "file.meta"
-	doneFileName      = "file.done"
+	DoneFileName      = "file.done"
 	deletedFileName   = "file.deleted"
 	bufMetaFilePath   = "buf.meta"
 	bufFilePath       = "buf.dat"
@@ -32,42 +34,52 @@ const (
 )
 
 const (
-	defaultDirPerm      = 0755
-	defaultFilePerm     = 0600
-	defautFileRetention = 7
+	DefautFileRetention = 7
 	metaFormat          = "%s\t%d\n"
+	tableDoneFormat     = "%s\n"
 	bufMetaFormat       = "read:%d\nwrite:%d\nbufsize:%d\n"
 	defaultIOLimit      = 20 //默认读取速度为20MB/s
+	ModeMetrics         = "metrics"
 )
 
 type Statistic struct {
-	ReaderCnt int64               `json:"reader_count"` // 读取总条数
-	ParserCnt [2]int64            `json:"parser_connt"` // [解析成功, 解析失败]
-	SenderCnt map[string][2]int64 `json:"sender_count"` // [发送成功, 发送失败]
+	ReaderCnt       int64                 `json:"reader_count"` // 读取总条数
+	ParserCnt       [2]int64              `json:"parser_connt"` // [解析成功, 解析失败]
+	SenderCnt       map[string][2]int64   `json:"sender_count"` // [发送成功, 发送失败]
+	ReadErrors      ErrorQueue            `json:"read_errors"`
+	ParseErrors     ErrorQueue            `json:"parse_errors"`
+	TransformErrors map[string]ErrorQueue `json:"transform_errors"`
+	SendErrors      map[string]ErrorQueue `json:"send_errors"`
 }
 
 type Meta struct {
 	mode              string //reader mode
-	dir               string // 记录文件处理进度的路径
+	Dir               string // 记录文件处理进度的路径
 	metaFilePath      string // 记录当前文件offset文件
-	doneFilePath      string // 记录扫描过文件记录的文件
+	DoneFilePath      string // 记录扫描过文件记录的文件
 	bufMetaFilePath   string // 记录buf的offset数据
 	bufFilePath       string // 记录buf数据
 	lineCacheFile     string //记录多行的缓存line
 	donefileretention int    // done.file保留时间，单位为天
 	encodingWay       string //文件编码格式，默认为utf-8
 	logpath           string
-	dataSourceTag     string //记录文件路径的标签名称
-	readlimit         int    //读取磁盘限速单位 MB/s
-	statisticPath     string // 记录 runner 计数信息
-	ftSaveLogPath     string // 记录 ft_sender 日志信息
+	dataSourceTag     string                 //记录文件路径的标签名称
+	TagFile           string                 //记录tag文件路径的标签名称
+	tags              map[string]interface{} //记录tag文件内容
+	Readlimit         int                    //读取磁盘限速单位 MB/s
+	statisticPath     string                 // 记录 runner 计数信息
+	ftSaveLogPath     string                 // 记录 ft_sender 日志信息
 	RunnerName        string
+	extrainfo         map[string]string
+
+	subMetaLock sync.RWMutex
+	subMetas    map[string]*Meta //对于tailx模式的情况会有嵌套的meta
 }
 
 func getValidDir(dir string) (realPath string, err error) {
-	realPath, fi, err := utils.GetRealPath(dir)
+	realPath, fi, err := GetRealPath(dir)
 	if os.IsNotExist(err) {
-		if err = os.MkdirAll(realPath, defaultDirPerm); err != nil {
+		if err = os.MkdirAll(realPath, DefaultDirPerm); err != nil {
 			//此处的error需要直接返回，后面会根据error类型是否为path error做判断
 			log.Errorf("fail to newMeta cannot create %v, err:%v", realPath, err)
 		}
@@ -82,7 +94,7 @@ func getValidDir(dir string) (realPath string, err error) {
 	return
 }
 
-func NewMeta(metadir, filedonedir, logpath, mode string, donefileRetention int) (m *Meta, err error) {
+func NewMeta(metadir, filedonedir, logpath, mode, tagfile string, donefileRetention int) (m *Meta, err error) {
 	metadir, err = getValidDir(metadir)
 	if err != nil {
 		//此处的error需要直接返回，后面会根据error类型是否为path error做判断
@@ -97,10 +109,17 @@ func NewMeta(metadir, filedonedir, logpath, mode string, donefileRetention int) 
 			return
 		}
 	}
+
+	tags, err := getTags(tagfile)
+	if err != nil {
+		log.Errorf("failed to get tags from %v error %v", tagfile, err)
+		return m, err
+	}
+
 	return &Meta{
-		dir:               metadir,
+		Dir:               metadir,
 		metaFilePath:      filepath.Join(metadir, metaFileName),
-		doneFilePath:      filedonedir,
+		DoneFilePath:      filedonedir,
 		bufFilePath:       filepath.Join(metadir, bufFilePath),
 		bufMetaFilePath:   filepath.Join(metadir, bufMetaFilePath),
 		lineCacheFile:     filepath.Join(metadir, lineCacheFilePath),
@@ -108,15 +127,12 @@ func NewMeta(metadir, filedonedir, logpath, mode string, donefileRetention int) 
 		ftSaveLogPath:     filepath.Join(metadir, ftSaveLogPath),
 		donefileretention: donefileRetention,
 		logpath:           logpath,
+		TagFile:           tagfile,
 		mode:              mode,
-		readlimit:         defaultIOLimit * 1024 * 1024,
+		tags:              tags,
+		Readlimit:         defaultIOLimit * 1024 * 1024,
+		subMetas:          make(map[string]*Meta),
 	}, nil
-}
-
-func hash(s string) string {
-	h := fnv.New32a()
-	h.Write([]byte(s))
-	return strconv.Itoa(int(h.Sum32()))
 }
 
 func getLogPathAbs(conf conf.MapConf) (logpath string, err error) {
@@ -128,6 +144,14 @@ func getLogPathAbs(conf conf.MapConf) (logpath string, err error) {
 	return filepath.Abs(logpath)
 }
 
+func getTagFileAbs(conf conf.MapConf) (tagfile string, err error) {
+	tagfile, _ = conf.GetStringOr(KeyTagFile, "")
+	if tagfile != "" {
+		return filepath.Abs(tagfile)
+	}
+	return
+}
+
 func NewMetaWithConf(conf conf.MapConf) (meta *Meta, err error) {
 	runnerName, _ := conf.GetStringOr(KeyRunnerName, "UndefinedRunnerName")
 	mode, _ := conf.GetStringOr(KeyMode, ModeDir)
@@ -136,26 +160,61 @@ func NewMetaWithConf(conf conf.MapConf) (meta *Meta, err error) {
 		return
 	}
 	err = nil
+	tagFile, err := getTagFileAbs(conf)
+	if err != nil {
+		return
+	}
 	metapath, _ := conf.GetStringOr(KeyMetaPath, "")
 	if metapath == "" {
-		runnerName, _ := conf.GetString(utils.GlobalKeyName)
+		runnerName, _ := conf.GetString(GlobalKeyName)
 		base := filepath.Base(logPath)
-		metapath = "meta/" + runnerName + "_" + hash(base)
+		metapath = "meta/" + runnerName + "_" + Hash(base)
 		log.Debugf("Runner[%v] Using %s as default metaPath", runnerName, metapath)
 	}
 	datasourceTag, _ := conf.GetStringOr(KeyDataSourceTag, "")
 	filedonepath, _ := conf.GetStringOr(KeyFileDone, metapath)
-	donefileRetention, _ := conf.GetIntOr(doneFileRetention, defautFileRetention)
+	donefileRetention, _ := conf.GetIntOr(doneFileRetention, DefautFileRetention)
 	readlimit, _ := conf.GetIntOr(KeyReadIOLimit, defaultIOLimit)
-	meta, err = NewMeta(metapath, filedonepath, logPath, mode, donefileRetention)
+	meta, err = NewMeta(metapath, filedonepath, logPath, mode, tagFile, donefileRetention)
 	if err != nil {
 		log.Warnf("Runner[%v] %s - newMeta failed, err:%v", runnerName, metapath, err)
 		return
 	}
+	extrainfo, _ := conf.GetBoolOr(ExtraInfo, false)
+	if extrainfo {
+		meta.extrainfo = utilsos.GetExtraInfo()
+	} else {
+		meta.extrainfo = make(map[string]string)
+	}
+	decoder, _ := conf.GetStringOr(KeyEncoding, "")
+	if decoder != "" {
+		meta.SetEncodingWay(strings.ToLower(decoder))
+	}
 	meta.dataSourceTag = datasourceTag
-	meta.readlimit = readlimit * 1024 * 1024 //readlimit*MB
+	meta.Readlimit = readlimit * 1024 * 1024 //readlimit*MB
 	meta.RunnerName = runnerName
 	return
+}
+
+func (m *Meta) AddSubMeta(key string, meta *Meta) error {
+	m.subMetaLock.Lock()
+	defer m.subMetaLock.Unlock()
+
+	if m.subMetas == nil {
+		m.subMetas = make(map[string]*Meta)
+	}
+	if _, ok := m.subMetas[key]; ok {
+		return fmt.Errorf("subMeta %v is exist", key)
+	}
+	m.subMetas[key] = meta
+	return nil
+}
+
+func (m *Meta) RemoveSubMeta(key string) {
+	m.subMetaLock.Lock()
+	defer m.subMetaLock.Unlock()
+
+	delete(m.subMetas, key)
 }
 
 func (m *Meta) IsExist() bool {
@@ -185,12 +244,12 @@ func (m *Meta) IsNotValid() bool {
 
 // Clear 删除所有meta信息
 func (m *Meta) Clear() error {
-	err := os.RemoveAll(m.dir)
+	err := os.RemoveAll(m.Dir)
 	if err != nil {
-		log.Errorf("Runner[%v] remove %v err %v", m.RunnerName, m.dir, err)
+		log.Errorf("Runner[%v] remove %v err %v", m.RunnerName, m.Dir, err)
 		return err
 	}
-	return os.MkdirAll(m.dir, defaultDirPerm)
+	return os.MkdirAll(m.Dir, DefaultDirPerm)
 }
 
 func (m *Meta) CacheLineFile() string {
@@ -202,7 +261,7 @@ func (m *Meta) ReadCacheLine() ([]byte, error) {
 }
 
 func (m *Meta) WriteCacheLine(lines string) error {
-	return ioutil.WriteFile(m.CacheLineFile(), []byte(lines), defaultFilePerm)
+	return ioutil.WriteFile(m.CacheLineFile(), []byte(lines), DefaultFilePerm)
 }
 
 func (m *Meta) ReadBufMeta() (r, w, bufsize int, err error) {
@@ -238,7 +297,7 @@ func (m *Meta) WriteBuf(buf []byte, r, w, bufsize int) (err error) {
 	}()
 
 	// write to tmp file
-	f, err = os.OpenFile(tmpBufMetaFileName, os.O_RDWR|os.O_CREATE, defaultFilePerm)
+	f, err = os.OpenFile(tmpBufMetaFileName, os.O_RDWR|os.O_CREATE, DefaultFilePerm)
 	if err != nil {
 		return
 	}
@@ -251,7 +310,7 @@ func (m *Meta) WriteBuf(buf []byte, r, w, bufsize int) (err error) {
 	f.Close()
 
 	// write to tmp file
-	f, err = os.OpenFile(tmpBufFileName, os.O_RDWR|os.O_CREATE, defaultFilePerm)
+	f, err = os.OpenFile(tmpBufFileName, os.O_RDWR|os.O_CREATE, DefaultFilePerm)
 	if err != nil {
 		return
 	}
@@ -296,6 +355,37 @@ func (m *Meta) ReadOffset() (currFile string, offset int64, err error) {
 	return
 }
 
+// ReadDBDoneFile 读取当前Database已经读取的表
+func (m *Meta) ReadDBDoneFile(database string) (content []string, err error) {
+	doneFiles, err := m.GetDoneFiles()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, f := range doneFiles {
+		filename := fmt.Sprintf("%v.%v", DoneFileName, database)
+		if filepath.Base(f.Path) == filename {
+			content, err = ReadFileContent(f.Path)
+			if err != nil {
+				return nil, err
+			}
+			return nil, err
+		}
+	}
+	return content, nil
+}
+
+// ReadRecordsFile 读取当前runner已经读取的表
+func (m *Meta) ReadRecordsFile(recordsFile string) ([]string, error) {
+	filename := fmt.Sprintf("%v.%v", DoneFileName, recordsFile)
+	content, err := ReadFileContent(filepath.Join(m.DoneFilePath, filename))
+	if err != nil {
+		return content, err
+	}
+
+	return content, nil
+}
+
 // WriteOffset 将当前文件和offset写入meta中
 func (m *Meta) WriteOffset(currFile string, offset int64) (err error) {
 	var f *os.File
@@ -303,7 +393,7 @@ func (m *Meta) WriteOffset(currFile string, offset int64) (err error) {
 	tmpFileName := fmt.Sprintf("%s.%d.tmp", fileName, rand.Int())
 
 	// write to tmp file
-	f, err = os.OpenFile(tmpFileName, os.O_RDWR|os.O_CREATE, defaultFilePerm)
+	f, err = os.OpenFile(tmpFileName, os.O_RDWR|os.O_CREATE, DefaultFilePerm)
 	if err != nil {
 		return err
 	}
@@ -320,7 +410,7 @@ func (m *Meta) WriteOffset(currFile string, offset int64) (err error) {
 
 // AppendDoneFile 将处理完的文件写入doneFile中
 func (m *Meta) AppendDoneFile(path string) (err error) {
-	f, err := os.OpenFile(m.DoneFile(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, defaultFilePerm)
+	f, err := os.OpenFile(m.DoneFile(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, DefaultFilePerm)
 	if err != nil {
 		return
 	}
@@ -330,20 +420,73 @@ func (m *Meta) AppendDoneFile(path string) (err error) {
 	return
 }
 
+// AppendDoneFileInode 将处理完的文件路径、inode以及完成时间写入doneFile中
+func (m *Meta) AppendDoneFileInode(path string, inode uint64) (err error) {
+	f, err := os.OpenFile(m.DoneFile(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, DefaultFilePerm)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	_, err = fmt.Fprintf(f, "%s\t%v\t%s\n", path, inode, time.Now().Format(time.RFC3339Nano))
+	return
+}
+
+func (m *Meta) GetDoneFileContent() ([]string, error) {
+	return m.getDoneFileContent()
+}
+
+func (m *Meta) getDoneFileContent() ([]string, error) {
+	ret := make([]string, 0)
+	files, err := m.getDoneFiles()
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range files {
+		contents, err := ReadFileContent(f.Path)
+		if err != nil {
+			log.Errorf("read done file %v err %v", f.Path, err)
+			continue
+		}
+		ret = append(ret, contents...)
+	}
+	return ret, nil
+}
+
+func joinFileInode(filename, inode string) string {
+	return filepath.Base(filename) + "_" + inode
+}
+
+func (m *Meta) GetDoneFileInode() map[string]bool {
+	inodeMap := make(map[string]bool)
+	contents, err := m.getDoneFileContent()
+	if err != nil {
+		log.Error(err)
+		return inodeMap
+	}
+	for _, v := range contents {
+		sps := strings.Split(v, "\t")
+		if len(sps) >= 2 {
+			inodeMap[joinFileInode(sps[0], sps[1])] = true
+		}
+	}
+	return inodeMap
+}
+
 // DoneFile 处理完成文件地址，按日进行rotate
 func (m *Meta) DoneFile() string {
 	now := time.Now()
-	return fmt.Sprintf("%v.%d-%d-%d", filepath.Join(m.doneFilePath, doneFileName), now.Year(), now.Month(), now.Day())
+	return fmt.Sprintf("%v.%d-%d-%d", filepath.Join(m.DoneFilePath, DoneFileName), now.Year(), now.Month(), now.Day())
 }
 
 // DeleteFile 处理完成文件地址，按日进行rotate
 func (m *Meta) DeleteFile() string {
 	now := time.Now()
-	return fmt.Sprintf("%v.%d-%d-%d", filepath.Join(m.doneFilePath, deletedFileName), now.Year(), now.Month(), now.Day())
+	return fmt.Sprintf("%v.%d-%d-%d", filepath.Join(m.DoneFilePath, deletedFileName), now.Year(), now.Month(), now.Day())
 }
 
 func (m *Meta) AppendDeleteFile(path string) (err error) {
-	f, err := os.OpenFile(m.DeleteFile(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, defaultFilePerm)
+	f, err := os.OpenFile(m.DeleteFile(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, DefaultFilePerm)
 	if err != nil {
 		return
 	}
@@ -356,7 +499,7 @@ func (m *Meta) AppendDeleteFile(path string) (err error) {
 // IsDoneFile 返回是否是Donefile格式的文件
 func (m *Meta) IsDoneFile(file string) bool {
 	file = filepath.Base(file)
-	return strings.HasPrefix(file, doneFileName)
+	return strings.HasPrefix(file, DoneFileName)
 }
 
 // MetaFile 返回metaFileoffset 的meta文件地址
@@ -379,11 +522,6 @@ func (m *Meta) BufMetaFile() string {
 	return m.bufMetaFilePath
 }
 
-//DoneFilePath 返回meta的filedone文件的存放目录
-func (m *Meta) DoneFilePath() string {
-	return m.doneFilePath
-}
-
 func (m *Meta) LogPath() string {
 	return m.logpath
 }
@@ -395,10 +533,10 @@ func (m *Meta) FtSaveLogPath() string {
 
 func (m *Meta) DeleteDoneFile(path string) error {
 	path = filepath.Base(path)
-	if !strings.HasPrefix(path, doneFileName) {
+	if !strings.HasPrefix(path, DoneFileName) {
 		return fmt.Errorf("%v file was not valid done file format", path)
 	}
-	dates := strings.Split(path[len(doneFileName)+1:], "-")
+	dates := strings.Split(path[len(DoneFileName)+1:], "-")
 	if len(dates) < 3 {
 		return fmt.Errorf("%v file was not valid done file format", path)
 	}
@@ -407,27 +545,47 @@ func (m *Meta) DeleteDoneFile(path string) error {
 	dd, _ := strconv.ParseInt(dates[2], 10, 64)
 	dur := time.Now().Sub(time.Date(int(dy), time.Month(dm), int(dd), 0, 0, 0, 0, time.Local))
 	if float64(m.donefileretention*24) < dur.Hours() {
-		return os.Remove(filepath.Join(m.doneFilePath, path))
+		return os.Remove(filepath.Join(m.DoneFilePath, path))
 	}
 	return nil
 }
 
-func (m *Meta) GetDoneFiles() (doneFiles []utils.File, err error) {
-	dir := m.doneFilePath
+func (m *Meta) GetDoneFiles() ([]File, error) {
+	myfiles, err := m.getDoneFiles()
+	if err != nil {
+		return nil, err
+	}
+
+	//submeta
+	m.subMetaLock.RLock()
+	defer m.subMetaLock.RUnlock()
+
+	for _, mv := range m.subMetas {
+		newfiles, err := mv.GetDoneFiles()
+		if err != nil {
+			return nil, err
+		}
+		myfiles = append(myfiles, newfiles...)
+	}
+	return myfiles, nil
+}
+
+func (m *Meta) getDoneFiles() (doneFiles []File, err error) {
+	dir := m.DoneFilePath
 	// 按文件时间从新到旧排列
-	files, err := utils.ReadDirByTime(dir)
+	files, err := ReadDirByTime(dir)
 	if err != nil {
 		log.Error(files, err)
 		return
 	}
 	for _, f := range files {
 		if f.IsDir() {
-			log.Warnf("Runner[%v] search file done skipped dir %v", m.RunnerName, f.Name())
+			log.Debugf("Runner[%v] search file done skipped dir %v", m.RunnerName, f.Name())
 			continue
 		}
 		fname := f.Name()
 		if m.IsDoneFile(fname) {
-			doneFiles = append(doneFiles, utils.File{
+			doneFiles = append(doneFiles, File{
 				Info: f,
 				Path: filepath.Join(dir, fname),
 			})
@@ -441,6 +599,13 @@ func (m *Meta) SetEncodingWay(e string) {
 	e = strings.ToUpper(e)
 	if e != "UTF-8" {
 		m.encodingWay = e
+	}
+
+	m.subMetaLock.RLock()
+	defer m.subMetaLock.RUnlock()
+
+	for _, mv := range m.subMetas {
+		mv.SetEncodingWay(e)
 	}
 }
 
@@ -461,25 +626,52 @@ func (m *Meta) GetDataSourceTag() string {
 	return m.dataSourceTag
 }
 
-func (b *Meta) Reset() error {
-	if b == nil {
+func (m *Meta) GetTagFile() string {
+	return m.TagFile
+}
+
+func (m *Meta) GetTags() map[string]interface{} {
+	return m.tags
+}
+
+func (m *Meta) Reset() error {
+	if m == nil {
 		return errors.New("Reset error as meta is nil")
 	}
-	if _, err := os.Stat(b.metaFilePath); err != nil {
+	if err := os.RemoveAll(m.statisticPath); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(b.metaFilePath); err != nil {
+	if err := os.RemoveAll(m.metaFilePath); err != nil {
 		return err
 	}
-	if b.doneFilePath != b.metaFilePath {
-		if _, err := os.Stat(b.doneFilePath); err != nil {
-			return err
-		}
-		if err := os.RemoveAll(b.doneFilePath); err != nil {
-			return err
+	// DoneFilePath 默认为 meta 文件夹，不能直接删除
+	files, err := ioutil.ReadDir(m.DoneFilePath)
+	if err != nil && os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		} else if strings.HasPrefix(file.Name(), DoneFileName) {
+			if err := os.RemoveAll(filepath.Join(m.DoneFilePath, file.Name())); err != nil {
+				return err
+			}
 		}
 	}
-	os.RemoveAll(b.statisticPath)
+
+	m.subMetaLock.RLock()
+	defer m.subMetaLock.RUnlock()
+
+	for key, mv := range m.subMetas {
+		err := mv.Reset()
+		if err != nil {
+			log.Errorf("reset sub meta %v err %v", key, err)
+			//出错继续reset
+			continue
+		}
+	}
 	return nil
 }
 
@@ -488,14 +680,29 @@ func (m *Meta) ReadStatistic() (stat Statistic, err error) {
 	if statData == nil || err != nil {
 		return
 	}
-	err = json.Unmarshal(statData, &stat)
+	err = jsoniter.Unmarshal(statData, &stat)
 	return
 }
 
 func (m *Meta) WriteStatistic(stat *Statistic) error {
-	statStr, err := json.Marshal(stat)
+	statStr, err := jsoniter.Marshal(stat)
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(m.StatisticFile(), statStr, defaultDirPerm)
+	return ioutil.WriteFile(m.StatisticFile(), statStr, DefaultFilePerm)
+}
+
+func (m *Meta) ExtraInfo() map[string]string {
+	return m.extrainfo
+}
+
+func checkRecordsFile(doneFiles []File, recordsFile string) bool {
+	for _, f := range doneFiles {
+		filename := fmt.Sprintf("%v.%v", DoneFileName, recordsFile)
+		if filepath.Base(f.Path) == filename {
+			return true
+		}
+	}
+
+	return false
 }

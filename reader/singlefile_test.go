@@ -8,9 +8,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/qiniu/logkit/utils"
-
 	"github.com/stretchr/testify/assert"
+
+	. "github.com/qiniu/logkit/reader/test"
+	. "github.com/qiniu/logkit/utils/models"
+	utilsos "github.com/qiniu/logkit/utils/os"
 )
 
 //测试single file rotate的情况
@@ -20,10 +22,10 @@ func Test_singleFileRotate(t *testing.T) {
 	metaDir := filepath.Join(os.TempDir(), "rotates")
 
 	//create file & write file
-	createTestFile(fileName, "12345")
+	CreateFile(fileName, "12345")
 
 	//create sf
-	meta, err := NewMeta(metaDir, metaDir, testlogpath, ModeFile, defautFileRetention)
+	meta, err := NewMeta(metaDir, metaDir, testlogpath, ModeFile, "", DefautFileRetention)
 	if err != nil {
 		t.Error(err)
 	}
@@ -35,13 +37,13 @@ func Test_singleFileRotate(t *testing.T) {
 	absPath, err := filepath.Abs(fileName)
 	assert.NoError(t, err)
 	assert.Equal(t, absPath, sf.Source())
-	oldInode, err := utils.GetIdentifyIDByPath(absPath)
+	oldInode, err := utilsos.GetIdentifyIDByPath(absPath)
 	assert.NoError(t, err)
 
 	//rotate file(rename old file + create new file)
 	renameTestFile(fileName, fileNameRotated)
 
-	createTestFile(fileName, "67890")
+	CreateFile(fileName, "67890")
 	//read file 正常读
 	p := make([]byte, 5)
 	n, err := sf.Read(p)
@@ -57,7 +59,7 @@ func Test_singleFileRotate(t *testing.T) {
 		t.Error(err)
 	}
 
-	newInode, err := utils.GetIdentifyIDByPath(fileName)
+	newInode, err := utilsos.GetIdentifyIDByPath(fileName)
 	assert.NoError(t, err)
 	assert.NotEqual(t, newInode, oldInode)
 
@@ -74,11 +76,11 @@ func Test_singleFileNotRotate(t *testing.T) {
 	metaDir := os.TempDir() + "/rotates"
 
 	//create file & write file
-	createTestFile(fileName, "12345")
-	defer deleteTestFile(fileName)
+	CreateFile(fileName, "12345")
+	defer DeleteFile(fileName)
 
 	//create sf
-	meta, err := NewMeta(metaDir, metaDir, testlogpath, ModeFile, defautFileRetention)
+	meta, err := NewMeta(metaDir, metaDir, testlogpath, ModeFile, "", DefautFileRetention)
 	if err != nil {
 		t.Error(err)
 	}
@@ -87,7 +89,7 @@ func Test_singleFileNotRotate(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	oldInode, err := utils.GetIdentifyIDByFile(sf.f)
+	oldInode, err := utilsos.GetIdentifyIDByFile(sf.f)
 	assert.NoError(t, err)
 
 	//read file 正常读
@@ -103,7 +105,7 @@ func Test_singleFileNotRotate(t *testing.T) {
 	n, err = sf.Read(p)
 	assert.Equal(t, io.EOF, err)
 
-	newInode, err := utils.GetIdentifyIDByFile(sf.f)
+	newInode, err := utilsos.GetIdentifyIDByFile(sf.f)
 	assert.NoError(t, err)
 	assert.Equal(t, newInode, oldInode)
 
@@ -117,16 +119,8 @@ func Test_singleFileNotRotate(t *testing.T) {
 	assert.Equal(t, "67890", string(p))
 }
 
-func createTestFile(fileName string, content string) {
-
-	f, _ := os.OpenFile(fileName, os.O_CREATE|os.O_WRONLY, defaultFilePerm)
-	f.WriteString(content)
-	f.Sync()
-	f.Close()
-}
-
 func appendTestFile(fileName, content string) {
-	f, _ := os.OpenFile(fileName, os.O_APPEND|os.O_WRONLY, defaultFilePerm)
+	f, _ := os.OpenFile(fileName, os.O_APPEND|os.O_WRONLY, DefaultFilePerm)
 	f.WriteString(content)
 	f.Sync()
 	f.Close()
@@ -134,8 +128,4 @@ func appendTestFile(fileName, content string) {
 
 func renameTestFile(from, to string) {
 	os.Rename(from, to)
-}
-
-func deleteTestFile(fileName string) {
-	os.RemoveAll(fileName)
 }

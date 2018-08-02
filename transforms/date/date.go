@@ -1,128 +1,72 @@
 package date
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
-	"reflect"
-	"strconv"
 	"time"
 
-	"github.com/qiniu/logkit/sender"
-	"github.com/qiniu/logkit/times"
 	"github.com/qiniu/logkit/transforms"
-	"github.com/qiniu/logkit/utils"
+	. "github.com/qiniu/logkit/utils/models"
 )
 
-type DateTrans struct {
+var (
+	_ transforms.StatsTransformer = &Transformer{}
+	_ transforms.Transformer      = &Transformer{}
+)
+
+type Transformer struct {
 	Key          string `json:"key"`
 	Offset       int    `json:"offset"`
 	LayoutBefore string `json:"time_layout_before"`
 	LayoutAfter  string `json:"time_layout_after"`
-	stats        utils.StatsInfo
+	stats        StatsInfo
 }
 
-func (g *DateTrans) RawTransform(datas []string) ([]string, error) {
+func (t *Transformer) RawTransform(datas []string) ([]string, error) {
 	return datas, errors.New("date transformer not support rawTransform")
 }
 
-func (g *DateTrans) Transform(datas []sender.Data) ([]sender.Data, error) {
-	var err, ferr error
-	errnums := 0
+func (t *Transformer) Transform(datas []Data) ([]Data, error) {
+	var err, fmtErr error
+	errNum := 0
+	keys := GetKeys(t.Key)
 	for i := range datas {
-		val, ok := datas[i][g.Key]
-		if !ok {
-			errnums++
-			err = fmt.Errorf("transform key %v not exist in data", g.Key)
+		val, getErr := GetMapValue(datas[i], keys...)
+		if getErr != nil {
+			errNum, err = transforms.SetError(errNum, getErr, transforms.GetErr, t.Key)
 			continue
 		}
-		val, err = g.convertDate(val)
-		if err != nil {
-			errnums++
+
+		// 如果用户设置了 offset，则不默认使用本地时区
+		loc := time.Local
+		if t.Offset != 0 {
+			loc = time.UTC
+		}
+
+		val, convertErr := ConvertDate(t.LayoutBefore, t.LayoutAfter, t.Offset, loc, val)
+		if convertErr != nil {
+			errNum, err = transforms.SetError(errNum, convertErr, transforms.General, "")
 			continue
 		}
-		datas[i][g.Key] = val
-	}
-	if err != nil {
-		g.stats.LastError = err.Error()
-		ferr = fmt.Errorf("find total %v erorrs in transform replace, last error info is %v", errnums, err)
-	}
-	g.stats.Errors += int64(errnums)
-	g.stats.Success += int64(len(datas) - errnums)
-	return datas, ferr
-}
-
-func (g *DateTrans) convertDate(v interface{}) (interface{}, error) {
-	var s int64
-	switch newv := v.(type) {
-	case int64:
-		s = newv
-	case int:
-		s = int64(newv)
-	case int32:
-		s = int64(newv)
-	case int16:
-		s = int64(newv)
-	case uint64:
-		s = int64(newv)
-	case uint32:
-		s = int64(newv)
-	case string:
-		if g.LayoutBefore != "" {
-			t, err := time.Parse(g.LayoutBefore, newv)
-			if err != nil {
-				return v, fmt.Errorf("can not parse %v with layout %v", newv, g.LayoutBefore)
-			}
-			return g.formatWithUserOption(t), nil
+		setErr := SetMapValue(datas[i], val, false, keys...)
+		if setErr != nil {
+			errNum, err = transforms.SetError(errNum, setErr, transforms.SetErr, t.Key)
 		}
-		t, err := times.StrToTime(newv)
-		if err != nil {
-			return v, err
-		}
-		return g.formatWithUserOption(t), nil
-	case json.Number:
-		jsonNumber, err := newv.Int64()
-		if err != nil {
-			return v, err
-		}
-		s = jsonNumber
-	default:
-		return v, fmt.Errorf("can not parse %v type %v as date time", v, reflect.TypeOf(v))
 	}
-	news := s
-	timestamp := strconv.FormatInt(news, 10)
-	timeSecondPrecision := 16
-	//补齐16位
-	for i := len(timestamp); i < timeSecondPrecision; i++ {
-		timestamp += "0"
-	}
-	// 取前16位，截取精度 微妙
-	timestamp = timestamp[0:timeSecondPrecision]
-	t, err := strconv.ParseInt(timestamp, 10, 64)
-	if err != nil {
-		return v, err
-	}
-	tm := time.Unix(0, t*int64(time.Microsecond))
-	return g.formatWithUserOption(tm), nil
+
+	t.stats, fmtErr = transforms.SetStatsInfo(err, t.stats, int64(errNum), int64(len(datas)), t.Type())
+	return datas, fmtErr
 }
 
-func (g *DateTrans) formatWithUserOption(t time.Time) interface{} {
-	t = t.Add(time.Duration(g.Offset) * time.Hour)
-	if g.LayoutAfter != "" {
-		return t.Format(g.LayoutAfter)
-	}
-	return t.Format(time.RFC3339Nano)
+func (t *Transformer) Description() string {
+	//return "transform string/long to specified date format"
+	return "将string/long数据转换成指定的时间格式, 如 1523878855 变为 2018-04-16T19:40:55+08:00"
 }
 
-func (g *DateTrans) Description() string {
-	return "transform string/long to specified date format"
-}
-
-func (g *DateTrans) Type() string {
+func (t *Transformer) Type() string {
 	return "date"
 }
 
-func (g *DateTrans) SampleConfig() string {
+func (t *Transformer) SampleConfig() string {
 	return `{
 		"type":"date",
 		"key":"DateFieldKey",
@@ -132,27 +76,16 @@ func (g *DateTrans) SampleConfig() string {
 	}`
 }
 
-func (it *DateTrans) ConfigOptions() []utils.Option {
-	return []utils.Option{
-		transforms.KeyStageAfterOnly,
+func (t *Transformer) ConfigOptions() []Option {
+	return []Option{
 		transforms.KeyFieldName,
-		{
-			KeyName:    "offset",
-			ChooseOnly: true,
-			ChooseOptions: []string{"0", "-1", "-2", "-3", "-4",
-				"-5", "-6", "-7", "-8", "-9", "-10", "-11", "-12",
-				"1", "2", "3", "4", "5", "6", "7", "8", "9", "11", "12"},
-			Default:      "0",
-			DefaultNoUse: false,
-			Description:  "时区偏移量(offset)",
-			Type:         transforms.TransformTypeString,
-		},
+		transforms.KeyTimezoneoffset,
 		{
 			KeyName:      "time_layout_before",
 			ChooseOnly:   false,
 			Default:      "",
 			DefaultNoUse: false,
-			Description:  "时间样式(不填自动解析)(time_layout_before)",
+			Description:  "当前时间样式(不填自动解析)(time_layout_before)",
 			Type:         transforms.TransformTypeString,
 		},
 		{
@@ -160,22 +93,28 @@ func (it *DateTrans) ConfigOptions() []utils.Option {
 			ChooseOnly:   false,
 			Default:      "",
 			DefaultNoUse: false,
-			Description:  "解析后时间样式(不填默认rfc3339)(time_layout_after)",
+			Advance:      true,
+			Description:  "期望时间样式(不填默认rfc3339)(time_layout_after)",
 			Type:         transforms.TransformTypeString,
 		},
 	}
 }
 
-func (g *DateTrans) Stage() string {
+func (t *Transformer) Stage() string {
 	return transforms.StageAfterParser
 }
 
-func (g *DateTrans) Stats() utils.StatsInfo {
-	return g.stats
+func (t *Transformer) Stats() StatsInfo {
+	return t.stats
+}
+
+func (t *Transformer) SetStats(err string) StatsInfo {
+	t.stats.LastError = err
+	return t.stats
 }
 
 func init() {
 	transforms.Add("date", func() transforms.Transformer {
-		return &DateTrans{}
+		return &Transformer{}
 	})
 }

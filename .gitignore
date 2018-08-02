@@ -6,6 +6,8 @@ ft_log
 
 # Mobile Tools for Java (J2ME)
 .mtj.tmp/
+.project
+.settings
 
 # Package Files #
 *.jar
@@ -28,6 +30,7 @@ _obj
 _test
 bin/
 pkg/
+!vendor/github.com/pkg
 tests
 tests/meta_mock_csv
 .idea/
@@ -49,14 +52,7 @@ _testmain.go
 *.test
 *.prof
 
-!vendor/
-vendor/*
-!vendor/github.com/
-vendor/github.com/*
-!vendor/github.com/labstack/
-vendor/github.com/labstack/*
-!vendor/github.com/labstack/echo/
-!vendor/github.com/wangtuanjie/
+meta/
 .DS_Store
 .cache
 .vscode
@@ -88,3 +84,26 @@ logkitweb/build
 npm-debug.log*
 ./logkitweb/yarn-debug.log*
 ./logkitweb/yarn-error.log*
+logkit.log-*
+logkitweb/package-lock.json
+
+
+# virtualenv
+.venv
+venv/
+ENV/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+
+# pyenv
+.python-version
+
+.metastore
+data/
+mytestservice/

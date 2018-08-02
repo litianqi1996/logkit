@@ -2,13 +2,13 @@ package main
 
 import (
 	"bufio"
-	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/qiniu/log"
 )
 
 // Reads all files in the grok_patterns/ folder
@@ -19,8 +19,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	out, _ := os.Create("parser/grok_patterns.go")
-	out.Write([]byte("//!!! Notice This is auto generated file, DO NOT EDIT IT!!! \n\n\n\npackage parser \n\nconst DEFAULT_PATTERNS = `"))
+	out, _ := os.Create("parser/grok/patterns.go")
+	out.Write([]byte("//!!! Notice This is auto generated file, DO NOT EDIT IT!!! \n\npackage grok \n\nconst DEFAULT_PATTERNS = `"))
 	for _, f := range files {
 		f, _ := os.Open(filepath.Join("grok_patterns", f.Name()))
 		rd := bufio.NewReader(f)
@@ -28,7 +28,7 @@ func main() {
 			data, err := rd.ReadBytes('\n')
 			if err != nil {
 				if err != io.EOF {
-					fmt.Println("ERROR:", err)
+					log.Error("ERROR:", err)
 				}
 				break
 			}

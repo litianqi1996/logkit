@@ -2,25 +2,26 @@ package reader
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/qiniu/logkit/rateio"
-	"github.com/qiniu/logkit/utils"
-
-	"sync"
-
-	"fmt"
 	"github.com/qiniu/log"
+
+	"github.com/qiniu/logkit/rateio"
+	. "github.com/qiniu/logkit/utils/models"
+	utilsos "github.com/qiniu/logkit/utils/os"
 )
 
 type SingleFile struct {
-	path       string      // 处理文件路径
+	realpath   string // 处理文件路径
+	originpath string
 	pfi        os.FileInfo // path 的文件信息
 	f          *os.File    // 当前处理文件
 	ratereader io.ReadCloser
@@ -34,14 +35,15 @@ type SingleFile struct {
 	meta *Meta // 记录offset的元数据
 }
 
-func NewSingleFile(meta *Meta, path, whence string, isFromWeb bool) (sf *SingleFile, err error) {
+func NewSingleFile(meta *Meta, path, whence string, errDirectReturn bool) (sf *SingleFile, err error) {
 	var pfi os.FileInfo
 	var f *os.File
+	originpath := path
 
 	for {
-		path, pfi, err = utils.GetRealPath(path)
+		path, pfi, err = GetRealPath(path)
 		if err != nil || pfi == nil {
-			if isFromWeb {
+			if errDirectReturn {
 				return sf, fmt.Errorf("runner[%v] %s - utils.GetRealPath failed, err:%v", meta.RunnerName, path, err)
 			}
 			log.Warnf("Runner[%v] %s - utils.GetRealPath failed, err:%v", meta.RunnerName, path, err)
@@ -49,7 +51,7 @@ func NewSingleFile(meta *Meta, path, whence string, isFromWeb bool) (sf *SingleF
 			continue
 		}
 		if !pfi.Mode().IsRegular() {
-			if isFromWeb {
+			if errDirectReturn {
 				return sf, fmt.Errorf("runner[%v] %s - file failed, err: file is not regular", meta.RunnerName, path)
 			}
 			log.Warnf("Runner[%v] %s - file failed, err: file is not regular", meta.RunnerName, path)
@@ -58,7 +60,7 @@ func NewSingleFile(meta *Meta, path, whence string, isFromWeb bool) (sf *SingleF
 		}
 		f, err = os.Open(path)
 		if err != nil {
-			if isFromWeb {
+			if errDirectReturn {
 				return sf, fmt.Errorf("runner[%v] %s - open file err:%v", meta.RunnerName, path, err)
 			}
 			log.Warnf("Runner[%v] %s - open file err:%v", meta.RunnerName, path, err)
@@ -78,17 +80,18 @@ func NewSingleFile(meta *Meta, path, whence string, isFromWeb bool) (sf *SingleF
 		}
 		omitMeta = true
 	}
-	if metafile != path {
-		log.Warnf("Runner[%v] %v -meta file <%v> is not current file <%v>， omit meta data", meta.RunnerName, meta.MetaFile(), metafile, path)
+	if metafile != originpath {
+		log.Warnf("Runner[%v] %v -meta file <%v> is not current file <%v>， omit meta data", meta.RunnerName, meta.MetaFile(), metafile, originpath)
 		omitMeta = true
 	}
 
 	sf = &SingleFile{
 		meta:       meta,
-		path:       path,
+		realpath:   path,
+		originpath: originpath,
 		pfi:        pfi,
 		f:          f,
-		ratereader: rateio.NewRateReader(f, meta.readlimit),
+		ratereader: rateio.NewRateReader(f, meta.Readlimit),
 		mux:        sync.Mutex{},
 	}
 
@@ -110,7 +113,7 @@ func NewSingleFile(meta *Meta, path, whence string, isFromWeb bool) (sf *SingleF
 	if sf.offset > st.Size() {
 		sf.offset = 0
 	}
-	_, err = f.Seek(sf.offset, os.SEEK_SET)
+	_, err = f.Seek(sf.offset, io.SeekStart)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +127,7 @@ func (sf *SingleFile) statFile(path string) (pfi os.FileInfo, err error) {
 			err = errors.New("reader " + sf.Name() + " has been exited")
 			return
 		}
-		path, pfi, err = utils.GetRealPath(path)
+		path, pfi, err = GetRealPath(path)
 		if err != nil || pfi == nil {
 			log.Warnf("Runner[%v] %s - utils.GetRealPath failed, err:%v", sf.meta.RunnerName, path, err)
 			time.Sleep(time.Minute)
@@ -136,31 +139,19 @@ func (sf *SingleFile) statFile(path string) (pfi os.FileInfo, err error) {
 }
 
 func (sf *SingleFile) openSingleFile(path string) (pfi os.FileInfo, f *os.File, err error) {
-
-	for {
-		if atomic.LoadInt32(&sf.stopped) > 0 {
-			err = errors.New("reader " + sf.Name() + " has been exited")
-			return
-		}
-
-		path, pfi, err = utils.GetRealPath(path)
-		if err != nil || pfi == nil {
-			log.Warnf("Runner[%v] %s - utils.GetRealPath failed, err:%v", sf.meta.RunnerName, path, err)
-			time.Sleep(time.Minute)
-			continue
-		}
-		if !pfi.Mode().IsRegular() {
-			log.Warnf("Runner[%v] %s - file failed, err: file is not regular", sf.meta.RunnerName, path)
-			time.Sleep(time.Minute)
-			continue
-		}
-		f, err = os.Open(path)
-		if err != nil {
-			log.Warnf("Runner[%v] %s - open file err:%v", sf.meta.RunnerName, path, err)
-			time.Sleep(time.Minute)
-			continue
-		}
-		break
+	path, pfi, err = GetRealPath(path)
+	if err != nil || pfi == nil {
+		err = fmt.Errorf("runner[%v] %s - utils.GetRealPath failed, err:%v", sf.meta.RunnerName, path, err)
+		return
+	}
+	if !pfi.Mode().IsRegular() {
+		err = fmt.Errorf("runner[%v] %s - file failed, err: file is not regular", sf.meta.RunnerName, path)
+		return
+	}
+	f, err = os.Open(path)
+	if err != nil {
+		err = fmt.Errorf("runner[%v] %s - open file err:%v", sf.meta.RunnerName, path, err)
+		return
 	}
 	return
 }
@@ -170,18 +161,18 @@ func (sf *SingleFile) startOffset(whence string) (int64, error) {
 	case WhenceOldest:
 		return 0, nil
 	case WhenceNewest:
-		return sf.f.Seek(0, os.SEEK_END)
+		return sf.f.Seek(0, io.SeekEnd)
 	default:
 		return 0, errors.New("whence not supported " + whence)
 	}
 }
 
 func (sf *SingleFile) Name() string {
-	return "SingleFile:" + sf.path
+	return "SingleFile:" + sf.originpath
 }
 
 func (sf *SingleFile) Source() string {
-	return sf.path
+	return sf.originpath
 }
 
 func (sf *SingleFile) Close() (err error) {
@@ -191,11 +182,14 @@ func (sf *SingleFile) Close() (err error) {
 	if sf.ratereader != nil {
 		sf.ratereader.Close()
 	}
-	return sf.f.Close()
+	if sf.f != nil {
+		return sf.f.Close()
+	}
+	return nil
 }
 
 func (sf *SingleFile) detectMovedName(inode uint64) (name string) {
-	dir := filepath.Dir(sf.path)
+	dir := filepath.Dir(sf.realpath)
 	fis, err := ioutil.ReadDir(dir)
 	if err != nil {
 		log.Errorf("Runner[%v] read SingleFile path %v err %v", sf.meta.RunnerName, dir, err)
@@ -206,7 +200,7 @@ func (sf *SingleFile) detectMovedName(inode uint64) (name string) {
 		if fi.IsDir() || !strings.HasPrefix(fi.Name(), sf.pfi.Name()) {
 			continue
 		}
-		newInode, err := utils.GetIdentifyIDByPath(filepath.Join(dir, fi.Name()))
+		newInode, err := utilsos.GetIdentifyIDByPath(filepath.Join(dir, fi.Name()))
 		if err != nil {
 			log.Error(err)
 			continue
@@ -220,11 +214,11 @@ func (sf *SingleFile) detectMovedName(inode uint64) (name string) {
 }
 
 func (sf *SingleFile) Reopen() (err error) {
-	newInode, err := utils.GetIdentifyIDByPath(sf.path)
+	newInode, err := utilsos.GetIdentifyIDByPath(sf.originpath)
 	if err != nil {
 		return
 	}
-	oldInode, err := utils.GetIdentifyIDByFile(sf.f)
+	oldInode, err := utilsos.GetIdentifyIDByFile(sf.f)
 	if err != nil {
 		return
 	}
@@ -233,14 +227,17 @@ func (sf *SingleFile) Reopen() (err error) {
 		return
 	}
 	sf.f.Close()
+	sf.f = nil
 	detectStr := sf.detectMovedName(oldInode)
 	if detectStr != "" {
-		if derr := sf.meta.AppendDoneFile(detectStr); derr != nil {
+		if derr := sf.meta.AppendDoneFileInode(detectStr, oldInode); derr != nil {
 			log.Errorf("Runner[%v] AppendDoneFile %v error %v", sf.meta.RunnerName, detectStr, derr)
 		}
+	} else {
+		detectStr = "not detected"
 	}
-	log.Infof("Runner[%v] rotate %s successfully , rotated file is <%v>", sf.meta.RunnerName, sf.path, detectStr)
-	pfi, f, err := sf.openSingleFile(sf.path)
+	log.Infof("Runner[%v] rotate %s successfully , rotated file is <%v>", sf.meta.RunnerName, sf.originpath, detectStr)
+	pfi, f, err := sf.openSingleFile(sf.originpath)
 	if err != nil {
 		return
 	}
@@ -249,13 +246,13 @@ func (sf *SingleFile) Reopen() (err error) {
 	if sf.ratereader != nil {
 		sf.ratereader.Close()
 	}
-	sf.ratereader = rateio.NewRateReader(f, sf.meta.readlimit)
+	sf.ratereader = rateio.NewRateReader(f, sf.meta.Readlimit)
 	sf.offset = 0
 	return
 }
 
 func (sf *SingleFile) reopenForESTALE() (err error) {
-	f, err := os.Open(sf.path)
+	f, err := os.Open(sf.originpath)
 	if err != nil {
 		return
 	}
@@ -264,7 +261,7 @@ func (sf *SingleFile) reopenForESTALE() (err error) {
 		f.Close()
 		return
 	}
-	_, err = f.Seek(sf.offset, os.SEEK_SET)
+	_, err = f.Seek(sf.offset, io.SeekStart)
 	if err != nil {
 		f.Close()
 		return
@@ -275,7 +272,7 @@ func (sf *SingleFile) reopenForESTALE() (err error) {
 	if sf.ratereader != nil {
 		sf.ratereader.Close()
 	}
-	sf.ratereader = rateio.NewRateReader(f, sf.meta.readlimit)
+	sf.ratereader = rateio.NewRateReader(f, sf.meta.Readlimit)
 	return
 }
 
@@ -289,7 +286,7 @@ func (sf *SingleFile) Read(p []byte) (n int, err error) {
 	if err != nil && strings.Contains(err.Error(), "stale NFS file handle") {
 		nerr := sf.reopenForESTALE()
 		if nerr != nil {
-			log.Errorf("Runner[%v] %v meet eror %v reopen error %v", sf.meta.RunnerName, sf.path, err, nerr)
+			log.Errorf("Runner[%v] %v meet eror %v reopen error %v", sf.meta.RunnerName, sf.originpath, err, nerr)
 		}
 		return
 	}
@@ -314,12 +311,32 @@ func (sf *SingleFile) Read(p []byte) (n int, err error) {
 func (sf *SingleFile) SyncMeta() error {
 	sf.mux.Lock()
 	defer sf.mux.Unlock()
-	if sf.lastSyncOffset == sf.offset && sf.lastSyncPath == sf.path {
+	if sf.lastSyncOffset == sf.offset && sf.lastSyncPath == sf.originpath {
 		log.Debugf("Runner[%v] %v was just syncd %v %v ignore it...", sf.meta.RunnerName, sf.Name(), sf.lastSyncPath, sf.lastSyncOffset)
 		return nil
 	}
 	log.Debugf("Runner[%v] %v Sync file success: %v", sf.meta.RunnerName, sf.Name(), sf.offset)
 	sf.lastSyncOffset = sf.offset
-	sf.lastSyncPath = sf.path
-	return sf.meta.WriteOffset(sf.path, sf.offset)
+	sf.lastSyncPath = sf.originpath
+	return sf.meta.WriteOffset(sf.originpath, sf.offset)
+}
+
+func (sf *SingleFile) Lag() (rl *LagInfo, err error) {
+	sf.mux.Lock()
+	rl = &LagInfo{Size: -sf.offset, SizeUnit: "bytes"}
+	sf.mux.Unlock()
+
+	fi, err := os.Stat(sf.originpath)
+	if os.IsNotExist(err) {
+		rl.Size = 0
+		return rl, nil
+	}
+
+	if err != nil {
+		rl.Size = 0
+		return rl, err
+	}
+	rl.Size += fi.Size()
+
+	return rl, nil
 }

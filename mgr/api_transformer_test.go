@@ -1,71 +1,74 @@
 package mgr
 
 import (
-	"encoding/json"
-	"fmt"
-	"io/ioutil"
 	"net/http"
-	"os"
-	"testing"
 
-	"github.com/labstack/echo"
 	"github.com/qiniu/logkit/transforms"
-	"github.com/qiniu/logkit/utils"
+	_ "github.com/qiniu/logkit/transforms/date"
+	. "github.com/qiniu/logkit/utils/models"
+
+	"github.com/json-iterator/go"
 	"github.com/stretchr/testify/assert"
 )
 
+type respTransformerRet struct {
+	Code string `json:"code"`
+	Data []Data `json:"data"`
+}
+
 // Rest 测试 端口容易冲突导致混淆，63xx
-func TestTransformerAPI(t *testing.T) {
-	pwd, err := os.Getwd()
-	if err != nil {
-		t.Error(err)
-	}
-	confdir := pwd + DEFAULT_LOGKIT_REST_DIR
-	defer os.RemoveAll(confdir)
+func transformerAPITest(p *testParam) {
+	t := p.t
+	rs := p.rs
 
-	var conf ManagerConfig
-	conf.BindHost = ":6301"
-	m, err := NewManager(conf)
-	if err != nil {
-		t.Fatal(err)
+	var got1 respModeUsages
+	url := "http://127.0.0.1" + rs.address + "/logkit/transformer/usages"
+	respCode, respBody, err := makeRequest(url, http.MethodGet, []byte{})
+	assert.NoError(t, err, string(respBody))
+	assert.Equal(t, http.StatusOK, respCode)
+	if err = jsoniter.Unmarshal(respBody, &got1); err != nil {
+		t.Fatalf("respBody %v unmarshal failed, error is %v", respBody, err)
 	}
-	rs := NewRestService(m, echo.New())
-	defer func() {
-		rs.Stop()
-		os.Remove(StatsShell)
-	}()
+	assert.Equal(t, len(transforms.Transformers), len(got1.Data))
 
-	var got1 []utils.KeyValue
+	var got2 respModeKeyOptions
+	url = "http://127.0.0.1" + rs.address + "/logkit/transformer/options"
+	respCode, respBody, err = makeRequest(url, http.MethodGet, []byte{})
+	assert.NoError(t, err, string(respBody))
+	assert.Equal(t, http.StatusOK, respCode)
+	if err = jsoniter.Unmarshal(respBody, &got2); err != nil {
+		t.Fatalf("respBody %v unmarshal failed, error is %v", respBody, err)
+	}
+	assert.Equal(t, len(transforms.Transformers), len(got2.Data))
 
-	resp, err := http.Get("http://127.0.0.1" + rs.address + "/logkit/transformer/usages")
-	if err != nil {
-		t.Error(err)
+	// Test transformer/transform with date transformer
+	var got3 respTransformerRet
+	var dateTransformerConfig = `{
+		"type":"date",
+		"key":"ts",
+		"offset":-1,
+		"time_layout_before":"",
+		"time_layout_after":"2006-01-02T15:04:05Z07:00",
+		"sampleLog":"{\"ts\":\"2006-01-02 15:04:05.997\"}"
+    }`
+	url = "http://127.0.0.1" + rs.address + "/logkit/transformer/transform"
+	respCode, respBody, err = makeRequest(url, http.MethodPost, []byte(dateTransformerConfig))
+	assert.NoError(t, err, string(respBody))
+	assert.Equal(t, http.StatusOK, respCode)
+	if err = jsoniter.Unmarshal(respBody, &got3); err != nil {
+		t.Fatalf("respBody %v unmarshal failed, error is %v", respBody, err)
 	}
-	content, _ := ioutil.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		t.Error(string(content))
-	}
-	err = json.Unmarshal(content, &got1)
-	if err != nil {
-		fmt.Println(string(content))
-		t.Error(err)
-	}
-	assert.Equal(t, len(transforms.Transformers), len(got1))
+	exp := []Data{{"ts": "2006-01-02T14:04:05Z"}}
+	assert.Equal(t, exp, got3.Data)
 
-	var got2 map[string][]utils.Option
-	resp, err = http.Get("http://127.0.0.1" + rs.address + "/logkit/transformer/options")
-	if err != nil {
-		t.Error(err)
+	// Test transformer/check with date transformer
+	var got4 respDataMessage
+	url = "http://127.0.0.1" + rs.address + "/logkit/transformer/check"
+	respCode, respBody, err = makeRequest(url, http.MethodPost, []byte(dateTransformerConfig))
+	assert.NoError(t, err, string(respBody))
+	assert.Equal(t, http.StatusOK, respCode)
+	if err = jsoniter.Unmarshal(respBody, &got4); err != nil {
+		t.Fatalf("respBody %v unmarshal failed, error is %v", respBody, err)
 	}
-	content, _ = ioutil.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		t.Error(string(content))
-	}
-	err = json.Unmarshal(content, &got2)
-	if err != nil {
-		fmt.Println(string(content))
-		t.Error(err)
-	}
-	assert.Equal(t, len(transforms.Transformers), len(got2))
-
+	assert.Equal(t, "", got4.Message)
 }

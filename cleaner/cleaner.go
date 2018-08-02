@@ -4,11 +4,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/qiniu/log"
-
 	"github.com/qiniu/logkit/conf"
 	"github.com/qiniu/logkit/reader"
-	"github.com/qiniu/logkit/utils"
+	. "github.com/qiniu/logkit/utils/models"
+
+	"github.com/qiniu/log"
 )
 
 type Cleaner struct {
@@ -26,14 +26,15 @@ type CleanSignal struct {
 	Logdir   string
 	Filename string
 	Cleaner  string
+	ReadMode string
 }
 
 const (
-	clean_enable      = "delete_enable"
-	clean_interval    = "delete_interval"
-	clean_name        = "cleaner_name"
-	reservefileNumber = "reserve_file_number"
-	reservefileSize   = "reserve_file_size"
+	KeyCleanEnable       = "delete_enable"
+	KeyCleanInterval     = "delete_interval"
+	KeyReserveFileNumber = "reserve_file_number"
+	KeyReserveFileSize   = "reserve_file_size"
+	clean_name           = "cleaner_name"
 
 	default_delete_interval     = 300  //5分钟
 	default_reserve_file_number = 10   //默认保存是个文件
@@ -45,30 +46,33 @@ const (
 // 删除文件时遍历全部
 // 删除时生成filedeleted文件
 func NewCleaner(conf conf.MapConf, meta *reader.Meta, cleanChan chan<- CleanSignal, logdir string) (c *Cleaner, err error) {
-	enable, _ := conf.GetBoolOr(clean_enable, false)
+	enable, _ := conf.GetBoolOr(KeyCleanEnable, false)
 	if !enable {
 		return
 	}
-	if meta.GetMode() != reader.ModeDir && meta.GetMode() != reader.ModeFile {
-		log.Errorf("cleaner only support reader mode in dir or file, now mode is %v, cleaner disabled", meta.GetMode())
+	mode := meta.GetMode()
+	if mode != reader.ModeDir && mode != reader.ModeFile && mode != reader.ModeCloudTrail && mode != reader.ModeTailx {
+		log.Errorf("cleaner only support reader mode dir|file|clocktrail|tailx, now mode is %v, cleaner disabled", meta.GetMode())
 		return
 	}
-	interval, _ := conf.GetIntOr(clean_interval, 0) //单位，秒
+	interval, _ := conf.GetIntOr(KeyCleanInterval, 0) //单位，秒
 	if interval <= 0 {
 		interval = default_delete_interval
 	}
 	name, _ := conf.GetStringOr(clean_name, "unknow")
-	reserveNumber, _ := conf.GetInt64Or(reservefileNumber, 0)
-	reserveSize, _ := conf.GetInt64Or(reservefileSize, 0)
+	reserveNumber, _ := conf.GetInt64Or(KeyReserveFileNumber, 0)
+	reserveSize, _ := conf.GetInt64Or(KeyReserveFileSize, 0)
 	if reserveNumber <= 0 && reserveSize <= 0 {
 		reserveNumber = default_reserve_file_number
 		reserveSize = default_reserve_file_size
 	}
 	reserveSize = reserveSize * MB
-	logdir, _, err = utils.GetRealPath(logdir)
-	if err != nil {
-		log.Errorf("GetRealPath for %v error %v", logdir, err)
-		return
+	if mode != reader.ModeTailx {
+		logdir, _, err = GetRealPath(logdir)
+		if err != nil {
+			log.Errorf("GetRealPath for %v error %v", logdir, err)
+			return
+		}
 	}
 	c = &Cleaner{
 		cleanTicker:   time.NewTicker(time.Duration(interval) * time.Second).C,
@@ -106,7 +110,7 @@ func (c *Cleaner) Name() string {
 	return c.name
 }
 
-func (c *Cleaner) shoudClean(size, count int64) bool {
+func (c *Cleaner) shouldClean(size, count int64) bool {
 	if c.reserveNumber > 0 && count > c.reserveNumber {
 		return true
 	}
@@ -118,11 +122,30 @@ func (c *Cleaner) shoudClean(size, count int64) bool {
 
 func (c *Cleaner) checkBelong(path string) bool {
 	dir := filepath.Dir(path)
-	dir, _, err := utils.GetRealPath(dir)
+	dir, _, err := GetRealPath(dir)
 	if err != nil {
 		log.Errorf("GetRealPath for %v error %v", path, err)
 		return false
 	}
+
+	switch c.meta.GetMode() {
+	case reader.ModeTailx:
+		matched, err := filepath.Match(filepath.Dir(c.logdir), filepath.Dir(path))
+		if err != nil {
+			log.Errorf("Failed to check if %q belongs to %q: %v", path, c.logdir, err)
+			return false
+		}
+		return matched
+
+	case reader.ModeDirx:
+		matched, err := filepath.Match(c.logdir, filepath.Dir(path))
+		if err != nil {
+			log.Errorf("Failed to check if %q belongs to %q: %v", path, c.logdir, err)
+			return false
+		}
+		return matched
+	}
+
 	if dir != c.logdir {
 		return false
 	}
@@ -139,7 +162,7 @@ func (c *Cleaner) Clean() (err error) {
 	}
 	checked := make(map[string]struct{})
 	for _, f := range doneFiles {
-		logFiles := utils.GetLogFiles(f.Path)
+		logFiles := GetLogFiles(f.Path)
 		allremoved := true
 		for _, logf := range logFiles {
 			if !c.checkBelong(logf.Path) {
@@ -152,13 +175,16 @@ func (c *Cleaner) Clean() (err error) {
 			size += logf.Info.Size()
 			count++
 			// 一旦符合条件，更老的文件必然都要删除
-			if beginClean || c.shoudClean(size, count) {
+			if beginClean || c.shouldClean(size, count) {
 				beginClean = true
-				c.cleanChan <- CleanSignal{
+				sig := CleanSignal{
 					Logdir:   filepath.Dir(logf.Path),
 					Filename: logf.Info.Name(),
 					Cleaner:  c.name,
+					ReadMode: c.meta.GetMode(),
 				}
+				log.Infof("send clean signal %v", sig)
+				c.cleanChan <- sig
 				if err = c.meta.AppendDeleteFile(logf.Path); err != nil {
 					log.Error(err)
 				}
@@ -173,4 +199,8 @@ func (c *Cleaner) Clean() (err error) {
 		}
 	}
 	return nil
+}
+
+func (c *Cleaner) LogDir() string {
+	return c.logdir
 }

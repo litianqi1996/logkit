@@ -8,6 +8,10 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/json-iterator/go"
+
+	"github.com/qiniu/logkit/utils/models"
 )
 
 var ErrStopped = errors.New("runner stopped")
@@ -16,16 +20,16 @@ var ErrMetaFileRead = errors.New("cannot read meta file")
 var ErrFileNotRegular = errors.New("file is not regular")
 var ErrFileNotDir = errors.New("file is not directory")
 
-var WaitNoSuchFile = time.Second
+var WaitNoSuchFile = 100 * time.Millisecond
 
 // getLatestFile 获得当前文件夹下最新的文件
 func getLatestFile(logdir string) (os.FileInfo, error) {
-	return getMaxFile(logdir, noCondition, modTimeLater)
+	return getMaxFile(logdir, noCondition, models.ModTimeLater)
 }
 
 // getOldestFile 获得当前文件夹下最旧的文件
 func getOldestFile(logdir string) (os.FileInfo, error) {
-	return getMinFile(logdir, noCondition, modTimeLater)
+	return getMinFile(logdir, noCondition, models.ModTimeLater)
 }
 
 // getMaxFile 在指定的限制条件condition下，根据比较函数gte 选择最大的os.FileInfo
@@ -83,11 +87,6 @@ func notCondition(f1 func(os.FileInfo) bool) func(os.FileInfo) bool {
 	}
 }
 
-// modTimeLater 按最后修改时间进行比较
-func modTimeLater(f1, f2 os.FileInfo) bool {
-	return f1.ModTime().Unix() >= f2.ModTime().Unix()
-}
-
 func HeadPatternMode(mode string, v interface{}) (reg *regexp.Regexp, err error) {
 	switch mode {
 	case ReadModeHeadPatternString:
@@ -115,12 +114,27 @@ func HeadPatternMode(mode string, v interface{}) (reg *regexp.Regexp, err error)
 	}
 }
 
-func parseLoopDuration(cronSched string) (dur time.Duration, err error) {
+func ParseLoopDuration(cronSched string) (dur time.Duration, err error) {
 	cronSched = strings.TrimSpace(strings.TrimPrefix(cronSched, Loop))
 	dur, err = time.ParseDuration(cronSched)
 	if err != nil {
 		dur = time.Duration(0)
 		err = fmt.Errorf("parse Cron loop duration %v error %v, make duration as 1 second", cronSched, err)
+	}
+	return
+}
+
+func getTags(tagFile string) (tags map[string]interface{}, err error) {
+	tags = make(map[string]interface{})
+	if tagFile == "" {
+		return
+	}
+	tagsData, err := ioutil.ReadFile(tagFile)
+	if tagsData == nil || err != nil {
+		return
+	}
+	if jerr := jsoniter.Unmarshal(tagsData, &tags); jerr != nil {
+		return
 	}
 	return
 }

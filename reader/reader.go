@@ -1,32 +1,53 @@
 package reader
 
 import (
+	"errors"
 	"fmt"
-	"strings"
-	"time"
 
 	"github.com/qiniu/log"
+
 	"github.com/qiniu/logkit/conf"
-	"github.com/qiniu/logkit/utils"
+	. "github.com/qiniu/logkit/utils/models"
 )
 
-// Reader 是一个通用的行读取reader接口
+// Reader 代表了一个通用的行读取器
 type Reader interface {
-	//Name reader名称
+	// Name 用于返回读取器的具体名称
 	Name() string
-	//Source 读取的数据源
-	Source() string
-	ReadLine() (string, error)
+	// SetMode 用于设置读取器的匹配模式
 	SetMode(mode string, v interface{}) error
-	Close() error
+	// Source 用于返回当前读取的数据源
+	Source() string
+	// ReadLine 用于向读取器请求返回一行数据
+	ReadLine() (string, error)
+	// SyncMeta 用于通知读取器保存同步相关元数据
 	SyncMeta()
+	// Close 用于关闭读取器
+	Close() error
+}
+
+// DaemonReader 代表了一个需要守护线程的读取器
+type DaemonReader interface {
+	// Start 用于非阻塞的启动读取器对应的守护线程，需要读取器自行负责其生命周期
+	Start() error
+}
+
+// DataReader 代表了一个可直接读取内存数据结构的读取器
+type DataReader interface {
+	// ReadData 用于读取一条数据以及数据的实际读取字节
+	ReadData() (Data, int64, error)
 }
 
 // StatsReader 是一个通用的带有统计接口的reader
 type StatsReader interface {
 	//Name reader名称
 	Name() string
-	Status() utils.StatsInfo
+	Status() StatsInfo
+}
+
+//获取数据lag的接口
+type LagReader interface {
+	Lag() (*LagInfo, error)
 }
 
 // FileReader reader 接口方法
@@ -38,31 +59,22 @@ type FileReader interface {
 	SyncMeta() error
 }
 
-// TODO 构建统一的 Server reader框架， 减少重复的编码
-type ServerReader interface {
-	//Name reader名称
-	Name() string
-	//Source 读取的数据源
-	Source() string
-	Start()
-	ReadLine() (string, error)
-	Close() error
-	SyncMeta()
-}
-
 // FileReader's conf keys
 const (
-	KeyLogPath       = "log_path"
-	KeyMetaPath      = "meta_path"
-	KeyFileDone      = "file_done"
-	KeyMode          = "mode"
-	KeyBufSize       = "reader_buf_size"
-	KeyWhence        = "read_from"
-	KeyEncoding      = "encoding"
-	KeyReadIOLimit   = "readio_limit"
-	KeyDataSourceTag = "datasource_tag"
-	KeyHeadPattern   = "head_pattern"
-	KeyRunnerName    = "runner_name"
+	KeyLogPath           = "log_path"
+	KeyMetaPath          = "meta_path"
+	KeyFileDone          = "file_done"
+	KeyMode              = "mode"
+	KeyBufSize           = "reader_buf_size"
+	KeyWhence            = "read_from"
+	KeyEncoding          = "encoding"
+	KeyMysqlEncoding     = "encoding"
+	KeyReadIOLimit       = "readio_limit"
+	KeyDataSourceTag     = "datasource_tag"
+	KeyTagFile           = "tag_file"
+	KeyHeadPattern       = "head_pattern"
+	KeyNewFileNewLine    = "newfile_newline"
+	KeySkipFileFirstLine = "skip_first_line"
 
 	// 忽略隐藏文件
 	KeyIgnoreHiddenFile = "ignore_hidden"
@@ -80,8 +92,11 @@ const (
 	KeyMysqlSQL         = "mysql_sql"
 	KeyMysqlCron        = "mysql_cron"
 	KeyMysqlExecOnStart = "mysql_exec_onstart"
+	KeyMysqlHistoryAll  = "mysql_history_all"
+	KyeMysqlTable       = "mysql_table"
 
-	KeySQLSchema = "sql_schema"
+	KeySQLSchema        = "sql_schema"
+	KeyMagicLagDuration = "magic_lag_duration"
 
 	KeyMssqlOffsetKey   = "mssql_offset_key"
 	KeyMssqlReadBatch   = "mssql_limit_batch"
@@ -90,6 +105,14 @@ const (
 	KeyMssqlSQL         = "mssql_sql"
 	KeyMssqlCron        = "mssql_cron"
 	KeyMssqlExecOnStart = "mssql_exec_onstart"
+
+	KeyPGsqlOffsetKey   = "postgres_offset_key"
+	KeyPGsqlReadBatch   = "postgres_limit_batch"
+	KeyPGsqlDataSource  = "postgres_datasource"
+	KeyPGsqlDataBase    = "postgres_database"
+	KeyPGsqlSQL         = "postgres_sql"
+	KeyPGsqlCron        = "postgres_cron"
+	KeyPGsqlExecOnStart = "postgres_exec_onstart"
 
 	KeyESReadBatch = "es_limit_batch"
 	KeyESIndex     = "es_index"
@@ -111,24 +134,40 @@ const (
 	KeyKafkaGroupID          = "kafka_groupid"
 	KeyKafkaTopic            = "kafka_topic"
 	KeyKafkaZookeeper        = "kafka_zookeeper"
+	KeyKafkaZookeeperChroot  = "kafka_zookeeper_chroot"
 	KeyKafkaZookeeperTimeout = "kafka_zookeeper_timeout"
+
+	KeyExecInterpreter   = "script_exec_interprepter"
+	KeyScriptCron        = "script_cron"
+	KeyScriptExecOnStart = "script_exec_onstart"
+
+	KeyErrDirectReturn = "errDirectReturn"
 )
 
-var defaultIgnoreFileSuffix = []string{
+var DefaultIgnoreFileSuffixes = []string{
 	".pid", ".swap", ".go", ".conf", ".tar.gz", ".tar", ".zip",
 	".a", ".o", ".so"}
 
 // FileReader's modes
 const (
-	ModeDir     = "dir"
-	ModeFile    = "file"
-	ModeTailx   = "tailx"
-	ModeMysql   = "mysql"
-	ModeMssql   = "mssql"
-	ModeElastic = "elastic"
-	ModeMongo   = "mongo"
-	ModeKafka   = "kafka"
-	ModeRedis   = "redis"
+	ModeDir        = "dir"
+	ModeFile       = "file"
+	ModeTailx      = "tailx"
+	ModeFileAuto   = "fileauto"
+	ModeDirx       = "dirx"
+	ModeMySQL      = "mysql"
+	ModeMSSQL      = "mssql"
+	ModePostgreSQL = "postgres"
+	ModeElastic    = "elastic"
+	ModeMongo      = "mongo"
+	ModeKafka      = "kafka"
+	ModeRedis      = "redis"
+	ModeSocket     = "socket"
+	ModeHTTP       = "http"
+	ModeScript     = "script"
+	ModeSnmp       = "snmp"
+	ModeCloudWatch = "cloudwatch"
+	ModeCloudTrail = "cloudtrail"
 )
 
 const (
@@ -146,115 +185,131 @@ const (
 	Loop = "loop"
 )
 
-// NewFileReader 创建FileReader
-func NewFileBufReader(conf conf.MapConf, isFromWeb bool) (reader Reader, err error) {
+const (
+	StatusInit int32 = iota
+	StatusStopped
+	StatusStopping
+	StatusRunning
+)
+
+func NewReader(conf conf.MapConf, errDirectReturn bool) (reader Reader, err error) {
+	rs := NewRegistry()
+	return rs.NewReader(conf, errDirectReturn)
+}
+
+//Deprecated: NewFileBufReader 名字上有歧义，实际上就是NewReader，包括任何类型，保证兼容性，保留
+func NewFileBufReader(conf conf.MapConf, errDirectReturn bool) (reader Reader, err error) {
+	rs := NewRegistry()
+	return rs.NewReader(conf, errDirectReturn)
+}
+
+type Constructor func(*Meta, conf.MapConf) (Reader, error)
+
+// registeredConstructors keeps a list of all available reader constructors can be registered by Registry.
+var registeredConstructors = map[string]Constructor{}
+
+// RegisterConstructor adds a new constructor for a given type of reader.
+func RegisterConstructor(typ string, c Constructor) {
+	registeredConstructors[typ] = c
+}
+
+// Registry reader 的工厂类。可以注册自定义reader
+type Registry struct {
+	readerTypeMap map[string]func(*Meta, conf.MapConf) (Reader, error)
+}
+
+func NewRegistry() *Registry {
+	ret := &Registry{
+		readerTypeMap: map[string]func(*Meta, conf.MapConf) (Reader, error){},
+	}
+	ret.RegisterReader(ModeDir, NewFileDirReader)
+	ret.RegisterReader(ModeFile, NewSingleFileReader)
+
+	for typ, c := range registeredConstructors {
+		ret.RegisterReader(typ, c)
+	}
+
+	return ret
+}
+
+func (reg *Registry) RegisterReader(readerType string, constructor Constructor) error {
+	_, exist := reg.readerTypeMap[readerType]
+	if exist {
+		return errors.New("readerType " + readerType + " has been existed")
+	}
+	reg.readerTypeMap[readerType] = constructor
+	return nil
+}
+
+func (reg *Registry) NewReader(conf conf.MapConf, errDirectReturn bool) (reader Reader, err error) {
 	meta, err := NewMetaWithConf(conf)
 	if err != nil {
 		log.Warn(err)
 		return
 	}
-	return NewFileBufReaderWithMeta(conf, meta, isFromWeb)
+	return reg.NewReaderWithMeta(conf, meta, errDirectReturn)
 }
 
-func NewFileBufReaderWithMeta(conf conf.MapConf, meta *Meta, isFromWeb bool) (reader Reader, err error) {
+func (reg *Registry) NewReaderWithMeta(conf conf.MapConf, meta *Meta, errDirectReturn bool) (Reader, error) {
+	if errDirectReturn {
+		conf[KeyErrDirectReturn] = Bool2String(errDirectReturn)
+	}
 	mode, _ := conf.GetStringOr(KeyMode, ModeDir)
-	logpath, err := conf.GetString(KeyLogPath)
-	if err != nil && (mode == ModeFile || mode == ModeDir || mode == ModeTailx) {
-		return
-	}
-	err = nil
-	bufSize, _ := conf.GetIntOr(KeyBufSize, defaultBufSize)
-	whence, _ := conf.GetStringOr(KeyWhence, WhenceOldest)
-	decoder, _ := conf.GetStringOr(KeyEncoding, "")
-	if decoder != "" {
-		meta.SetEncodingWay(strings.ToLower(decoder))
-	}
 	headPattern, _ := conf.GetStringOr(KeyHeadPattern, "")
-	var fr FileReader
-	switch mode {
-	case ModeDir:
-		// 默认不读取隐藏文件
-		ignoreHidden, _ := conf.GetBoolOr(KeyIgnoreHiddenFile, true)
-		ignoreFileSuffix, _ := conf.GetStringListOr(KeyIgnoreFileSuffix, defaultIgnoreFileSuffix)
-		validFilesRegex, _ := conf.GetStringOr(KeyValidFilePattern, "*")
-		fr, err = NewSeqFile(meta, logpath, ignoreHidden, ignoreFileSuffix, validFilesRegex, whence)
-		if err != nil {
-			return
-		}
-		reader, err = NewReaderSize(fr, meta, bufSize)
 
-	case ModeFile:
-		fr, err = NewSingleFile(meta, logpath, whence, isFromWeb)
-		if err != nil {
-			return
-		}
-		reader, err = NewReaderSize(fr, meta, bufSize)
-	case ModeTailx:
-		expireDur, _ := conf.GetStringOr(KeyExpire, "24h")
-		stateIntervalDur, _ := conf.GetStringOr(KeyStatInterval, "3m")
-		maxOpenFiles, _ := conf.GetIntOr(KeyMaxOpenFiles, 256)
-		reader, err = NewMultiReader(meta, logpath, whence, expireDur, stateIntervalDur, maxOpenFiles)
-	case ModeMysql: // Mysql 模式是启动mysql reader,读取mysql数据表
-		reader, err = NewSQLReader(meta, conf)
-	case ModeMssql: // Mssql 模式是启动mssql reader，读取mssql数据表
-		reader, err = NewSQLReader(meta, conf)
-	case ModeElastic:
-		readBatch, _ := conf.GetIntOr(KeyESReadBatch, 100)
-		estype, err := conf.GetString(KeyESType)
-		if err != nil {
-			return nil, err
-		}
-		esindex, err := conf.GetString(KeyESIndex)
-		if err != nil {
-			return nil, err
-		}
-		eshost, _ := conf.GetStringOr(KeyESHost, "http://localhost:9200")
-		if !strings.HasPrefix(eshost, "http://") && !strings.HasPrefix(eshost, "https://") {
-			eshost = "http://" + eshost
-		}
-		esVersion, _ := conf.GetStringOr(KeyESVersion, ElasticVersion2)
-		keepAlive, _ := conf.GetStringOr(KeyESKeepAlive, "6h")
-		reader, err = NewESReader(meta, readBatch, estype, esindex, eshost, esVersion, keepAlive)
-	case ModeMongo:
-		readBatch, _ := conf.GetIntOr(KeyMongoReadBatch, 100)
-		database, err := conf.GetString(KeyMongoDatabase)
-		if err != nil {
-			return nil, err
-		}
-		coll, err := conf.GetString(KeyMongoCollection)
-		if err != nil {
-			return nil, err
-		}
-		mongohost, _ := conf.GetStringOr(KeyMongoHost, "localhost:9200")
-		offsetKey, _ := conf.GetStringOr(KeyMongoOffsetKey, MongoDefaultOffsetKey)
-		cronSchedule, _ := conf.GetStringOr(KeyMongoCron, "")
-		execOnStart, _ := conf.GetBoolOr(KeyMongoExecOnstart, true)
-		filters, _ := conf.GetStringOr(KeyMongoFilters, "")
-		certfile, _ := conf.GetStringOr(KeyMongoCert, "")
-		reader, err = NewMongoReader(meta, readBatch, mongohost, database, coll, offsetKey, cronSchedule, filters, certfile, execOnStart)
-	case ModeKafka:
-		consumerGroup, err := conf.GetString(KeyKafkaGroupID)
-		if err != nil {
-			return nil, err
-		}
-		topics, err := conf.GetStringList(KeyKafkaTopic)
-		if err != nil {
-			return nil, err
-		}
-		zkTimeout, _ := conf.GetIntOr(KeyKafkaZookeeperTimeout, 1)
-
-		zookeepers, err := conf.GetStringList(KeyKafkaZookeeper)
-		reader, err = NewKafkaReader(meta, consumerGroup, topics, zookeepers, time.Duration(zkTimeout)*time.Second, whence)
-	case ModeRedis:
-		reader, err = NewRedisReader(meta, conf)
-	default:
-		err = fmt.Errorf("mode %v not supported now", mode)
+	constructor, exist := reg.readerTypeMap[mode]
+	if !exist {
+		return nil, fmt.Errorf("reader type unsupperted : %v", mode)
 	}
+
+	reader, err := constructor(meta, conf)
 	if err != nil {
-		return
+		return nil, err
 	}
 	if headPattern != "" {
 		err = reader.SetMode(ReadModeHeadPatternString, headPattern)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return
+
+	return reader, nil
+}
+
+func NewFileDirReader(meta *Meta, conf conf.MapConf) (reader Reader, err error) {
+	whence, _ := conf.GetStringOr(KeyWhence, WhenceOldest)
+	logpath, err := conf.GetString(KeyLogPath)
+	if err != nil {
+		return
+	}
+	bufSize, _ := conf.GetIntOr(KeyBufSize, DefaultBufSize)
+
+	// 默认不读取隐藏文件
+	ignoreHidden, _ := conf.GetBoolOr(KeyIgnoreHiddenFile, true)
+	ignoreFileSuffix, _ := conf.GetStringListOr(KeyIgnoreFileSuffix, DefaultIgnoreFileSuffixes)
+	validFilesRegex, _ := conf.GetStringOr(KeyValidFilePattern, "*")
+	newfileNewLine, _ := conf.GetBoolOr(KeyNewFileNewLine, false)
+	skipFirstLine, _ := conf.GetBoolOr(KeySkipFileFirstLine, false)
+	fr, err := NewSeqFile(meta, logpath, ignoreHidden, newfileNewLine, ignoreFileSuffix, validFilesRegex, whence)
+	if err != nil {
+		return
+	}
+	fr.SkipFileFirstLine = skipFirstLine
+	return NewReaderSize(fr, meta, bufSize)
+}
+
+func NewSingleFileReader(meta *Meta, conf conf.MapConf) (reader Reader, err error) {
+	logpath, err := conf.GetString(KeyLogPath)
+	if err != nil {
+		return
+	}
+	bufSize, _ := conf.GetIntOr(KeyBufSize, DefaultBufSize)
+	whence, _ := conf.GetStringOr(KeyWhence, WhenceOldest)
+	errDirectReturn, _ := conf.GetBoolOr(KeyErrDirectReturn, true)
+
+	fr, err := NewSingleFile(meta, logpath, whence, errDirectReturn)
+	if err != nil {
+		return
+	}
+	return NewReaderSize(fr, meta, bufSize)
 }
